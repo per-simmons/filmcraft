@@ -2577,6 +2577,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::push_in::commands());
     v.extend(crate::waveform::commands());
     v.extend(crate::screen_activity::commands());
+    v.extend(crate::face::commands());
     v.extend(crate::panels::commands());
     v.extend(crate::scopes::commands());
     v.extend(crate::remix::commands());

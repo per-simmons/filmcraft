@@ -1913,6 +1913,7 @@ dependencies = [
  "filmcraft-testkit",
  "filmcraft-text",
  "filmcraft-time",
+ "filmcraft-vision",
  "image",
  "log",
  "serde",
@@ -2289,6 +2290,15 @@ dependencies = [
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
  "web-time",
+]
+
+[[package]]
+name = "filmcraft-vision"
+version = "0.4.0"
+dependencies = [
+ "image",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

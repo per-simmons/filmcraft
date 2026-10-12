@@ -19,6 +19,7 @@ pub mod commands;
 pub mod demo;
 pub mod essential_sound;
 pub mod export_tools;
+pub mod face;
 pub mod gaps;
 pub mod graphic_templates;
 pub mod graphics;
@@ -380,6 +381,9 @@ pub struct Session {
     /// Speech recogniser for `transcript.generate` (None = the Whisper model named by the command,
     /// feature `whisper`). Hosts and tests install one here.
     pub transcriber: Option<Arc<dyn filmcraft_speech::Transcriber>>,
+    /// Face detector for `video.faces` / `video.alignEyes` (None = the downloaded MediaPipe models).
+    /// Hosts and tests install one here.
+    pub face_detector: Option<Arc<dyn face::FaceDetector>>,
     /// The Events panel log: failed commands, job results, auto-save errors, messages.
     pub log: panels::EventLog,
     /// Media Browser navigation (directory, back / forward history, selected files).
@@ -471,6 +475,7 @@ impl Session {
             export_queue: Default::default(),
             stepped: Vec::new(),
             transcriber: None,
+            face_detector: None,
             log: Default::default(),
             browser: Default::default(),
             exec_depth: 0,
@@ -1057,6 +1062,8 @@ mod essential_sound_tests;
 mod explicit_targets_tests;
 #[cfg(test)]
 mod export_tests;
+#[cfg(test)]
+mod face_tests;
 #[cfg(test)]
 mod file_tests;
 #[cfg(test)]
