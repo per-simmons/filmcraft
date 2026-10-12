@@ -24,7 +24,17 @@ const EXACT: f32 = 1e-4;
 const FLIPS: f64 = 0.01;
 
 fn cx(t: Tick, px_scale: f32) -> FxCtx<'static> {
-    FxCtx { t, px_scale, seconds: 0.0, timecode: "", clip_name: "", project: None, env: None, working: filmcraft_color::WorkingSpace::Rec709 }
+    FxCtx {
+        t,
+        frame: Tick::ZERO,
+        px_scale,
+        seconds: 0.0,
+        timecode: "",
+        clip_name: "",
+        project: None,
+        env: None,
+        working: filmcraft_color::WorkingSpace::Rec709,
+    }
 }
 
 fn effect(id: &str, params: &[(&str, ParamValue)]) -> EffectInstance {
@@ -487,5 +497,52 @@ fn layers_with_effects_fall_back_to_the_cpu_without_a_stage() {
         let (p99, mean, _) = stats8(&cpu, &gpu, &interior(&plan));
         eprintln!("effect stage {stage}: interior p99 {p99}, mean {mean:.3}");
         assert!(p99 <= 6 && mean < 1.5, "stage {stage}: p99 {p99}, mean {mean}");
+    }
+}
+
+/// Transform motion blur (sub-frame resamples averaged) runs in the shader exactly as on the CPU,
+/// alone and between other effects, and a static or shutter-0 Transform stays a single resample.
+#[test]
+fn transform_motion_blur_matches_cpu() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (96u32, 54u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let fd = filmcraft_time::FrameRate::new(24, 1).frame_duration();
+    for (angle, rot) in [(180.0, 0.0), (360.0, 25.0), (90.0, -10.0)] {
+        let mut e = effect("transform", &[("use_comp_shutter", ParamValue::Bool(false)), ("shutter_angle", fl(angle))]);
+        let p = e.params.get_mut("scale_height").expect("scale");
+        p.put_keyframe(Tick::ZERO, fl(100.0));
+        p.put_keyframe(Tick(fd.0 * 4), fl(160.0));
+        let p = e.params.get_mut("position").expect("position");
+        p.put_keyframe(Tick::ZERO, pt(48.0, 27.0));
+        p.put_keyframe(Tick(fd.0 * 4), pt(30.0, 20.0));
+        let p = e.params.get_mut("rotation").expect("rotation");
+        p.put_keyframe(Tick::ZERO, fl(0.0));
+        p.put_keyframe(Tick(fd.0 * 4), fl(rot));
+        let cx = FxCtx { frame: fd, ..cx(Tick(fd.0 * 2), 1.0) };
+        let op = FxOp::eval(&e, &cx, w as usize, h as usize).expect("op");
+        let FxOp::MotionResample(samples) = &op else { panic!("angle {angle}: not motion-blurred: {op:?}") };
+        assert!(samples.len() > 2, "angle {angle}: {} samples", samples.len());
+        assert!(op.gpu_ok());
+        let chains = [vec![op.clone()], vec![FxOp::BrightnessContrast { br: 0.1, co: 1.2 }, op.clone(), FxOp::HFlip]];
+        for ops in chains {
+            let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+            for o in &ops {
+                o.apply(&mut cpu);
+            }
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops }).expect("effect image");
+            let (worst, flips) = compare(&cpu.px, &gpu);
+            eprintln!("motion blur {angle}°: max rel diff {worst:.2e}, {:.3}% flipped", flips * 100.0);
+            assert!(worst < EXACT * 2.0 && flips == 0.0, "angle {angle}: {worst}, {flips}");
+        }
+        // shutter closed: the plain resample
+        let mut closed = e.clone();
+        closed.params.get_mut("shutter_angle").expect("angle").value = fl(0.0);
+        assert!(matches!(FxOp::eval(&closed, &cx, w as usize, h as usize), Some(FxOp::Resample(_))));
     }
 }

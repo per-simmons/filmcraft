@@ -12,6 +12,7 @@
 use filmcraft_color::{hsl_to_rgb, linear_to_srgb, luma709, rgb_to_hsl};
 use filmcraft_geom::Affine;
 use filmcraft_project::EffectInstance;
+use filmcraft_time::Tick;
 use rayon::prelude::*;
 
 use crate::effects::{FxCtx, b, choice, color, dec, enc, f, gaussian_boxes, point};
@@ -122,6 +123,9 @@ pub enum FxOp {
         feather: f32,
     },
     Resample(Resample),
+    /// Transform motion blur: the mean of `Resample`s of the same image at sub-frame times
+    /// across the shutter interval (at most [`MOTION_BLUR_MAX_SAMPLES`]).
+    MotionResample(Vec<Resample>),
     HFlip,
     VFlip,
     Mirror {
@@ -197,6 +201,88 @@ pub const GPU_EFFECTS: &[&str] = &[
     "color_replace",
     "alpha_adjust",
 ];
+
+/// Most sub-frame samples a motion-blurred Transform averages (the GPU uniform holds this many).
+pub const MOTION_BLUR_MAX_SAMPLES: usize = 16;
+/// A sequence's own ("composition") shutter angle: Premiere sequences have none, so Transform's
+/// "Use Composition's Shutter Angle" means no motion blur.
+pub const COMPOSITION_SHUTTER_ANGLE: f32 = 0.0;
+
+/// Transform's forward map (working-image pixels → working-image pixels) and opacity at `cx.t`.
+fn transform_matrix(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> (Affine, f32) {
+    let img = Image { w, h, px: Vec::new() };
+    let anchor = point(e, "anchor", cx, &img);
+    let pos = point(e, "position", cx, &img);
+    let sh = f(e, "scale_height", cx) as f64 / 100.0;
+    let sw = if b(e, "uniform_scale") { sh } else { f(e, "scale_width", cx) as f64 / 100.0 };
+    let rot = f(e, "rotation", cx) as f64;
+    let skew = (f(e, "skew", cx) as f64).to_radians().tan();
+    let skew_axis = f(e, "skew_axis", cx) as f64;
+    let op = f(e, "opacity", cx) / 100.0;
+    let sk = Affine::rotate_deg(skew_axis).then_apply(&Affine { a: 1.0, b: 0.0, c: skew, d: 1.0, e: 0.0, f: 0.0 }).then_apply(&Affine::rotate_deg(-skew_axis));
+    let m = Affine::translate(pos.x, pos.y)
+        .then_apply(&Affine::rotate_deg(rot))
+        .then_apply(&sk)
+        .then_apply(&Affine::scale(sw, sh))
+        .then_apply(&Affine::translate(-anchor.x, -anchor.y));
+    (m, op)
+}
+
+/// The single-time op of a Transform map (the mip path for a minifying map, CPU only).
+fn transform_op(m: Affine, op: f32, w: usize, h: usize) -> Resample {
+    if minifies(&m, w, h) {
+        // the CPU's mip path (`Image::transformed` with the forward map; `rect` u32::MAX marks it)
+        return Resample { inv: Some(m), rect: [u32::MAX; 4], opacity: op };
+    }
+    resample(w, h, &m, op)
+}
+
+/// The time the shutter stays open, in effect time: Shutter Angle / 360° of a frame. None for no
+/// motion blur (composition shutter, an angle of 0, or no frame duration known).
+fn shutter_span(e: &EffectInstance, cx: &FxCtx) -> Option<Tick> {
+    if cx.frame.0 <= 0 {
+        return None;
+    }
+    // (missing in projects saved before the parameter existed: Premiere's default, on)
+    let comp = e.param("use_comp_shutter").and_then(|p| p.value.as_bool()).unwrap_or(true);
+    let angle = if comp { COMPOSITION_SHUTTER_ANGLE } else { f(e, "shutter_angle", cx) };
+    if !angle.is_finite() || angle <= 0.0 {
+        return None;
+    }
+    let span = (cx.frame.0 as f64 * angle.min(360.0) as f64 / 360.0).round();
+    (span >= 2.0).then_some(Tick(span as i64))
+}
+
+/// Motion blur for a Transform whose map at `cx.t` is `m`: the sub-frame ops to average, or None
+/// when the shutter is closed or the layer does not move during it (then the plain op is exact
+/// and costs nothing extra). The shutter interval is centred on the frame time; samples sit at
+/// the midpoints of `n` equal slices of it, `n` growing with how far the image's corners travel
+/// (about one working pixel per slice, capped at [`MOTION_BLUR_MAX_SAMPLES`]). Pure function of
+/// the effect and the time: deterministic.
+fn motion_samples(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize, m: &Affine) -> Option<Vec<Resample>> {
+    let span = shutter_span(e, cx)?.0;
+    let half = span / 2;
+    let at = |dt: i64| transform_matrix(e, &FxCtx { t: Tick(cx.t.0.saturating_add(dt)), ..*cx }, w, h);
+    let (m0, _) = at(-half);
+    let (m1, _) = at(span - half);
+    let (fw, fh) = (w as f64, h as f64);
+    let probes = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh), (fw / 2.0, fh / 2.0)].map(|(x, y)| filmcraft_geom::Vec2::new(x, y));
+    let dist = |a: filmcraft_geom::Vec2, b: filmcraft_geom::Vec2| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+    let travel = probes.iter().map(|p| dist(m0.apply(*p), m.apply(*p)) + dist(m.apply(*p), m1.apply(*p))).fold(0.0f64, f64::max);
+    // (a non-finite travel: a degenerate map, rendered as it is without blur)
+    if !travel.is_finite() || travel < 0.25 {
+        return None;
+    }
+    let n = ((travel.ceil() as usize).saturating_add(1)).clamp(2, MOTION_BLUR_MAX_SAMPLES);
+    let samples = (0..n)
+        .map(|i| {
+            let off = ((2 * i + 1) as i128 * span as i128 / (2 * n) as i128) as i64 - half;
+            let (mi, op) = at(off);
+            transform_op(mi, op, w, h)
+        })
+        .collect();
+    Some(samples)
+}
 
 /// `Image::transformed` without the mip path: the destination rectangle it writes and the inverse.
 fn resample(w: usize, h: usize, m: &Affine, opacity: f32) -> Resample {
@@ -343,29 +429,11 @@ impl FxOp {
                 FxOp::crop_rect(w, h, 0.0, 0.0, 0.0, 0.0, amt)
             }
             "transform" => {
-                let img = Image { w, h, px: Vec::new() };
-                let anchor = point(e, "anchor", cx, &img);
-                let pos = point(e, "position", cx, &img);
-                let sh = f(e, "scale_height", cx) as f64 / 100.0;
-                let sw = if b(e, "uniform_scale") { sh } else { f(e, "scale_width", cx) as f64 / 100.0 };
-                let rot = f(e, "rotation", cx) as f64;
-                let skew = (f(e, "skew", cx) as f64).to_radians().tan();
-                let skew_axis = f(e, "skew_axis", cx) as f64;
-                let op = f(e, "opacity", cx) / 100.0;
-                let sk = Affine::rotate_deg(skew_axis)
-                    .then_apply(&Affine { a: 1.0, b: 0.0, c: skew, d: 1.0, e: 0.0, f: 0.0 })
-                    .then_apply(&Affine::rotate_deg(-skew_axis));
-                let m = Affine::translate(pos.x, pos.y)
-                    .then_apply(&Affine::rotate_deg(rot))
-                    .then_apply(&sk)
-                    .then_apply(&Affine::scale(sw, sh))
-                    .then_apply(&Affine::translate(-anchor.x, -anchor.y));
-                if minifies(&m, w, h) {
-                    // the CPU's mip path (`Image::transformed` with the forward map; `rect`
-                    // u32::MAX marks it): CPU only
-                    return Some(FxOp::Resample(Resample { inv: Some(m), rect: [u32::MAX; 4], opacity: op }));
+                let (m, op) = transform_matrix(e, cx, w, h);
+                if let Some(samples) = motion_samples(e, cx, w, h, &m) {
+                    return Some(FxOp::MotionResample(samples));
                 }
-                FxOp::Resample(resample(w, h, &m, op))
+                FxOp::Resample(transform_op(m, op, w, h))
             }
             "horizontal_flip" => FxOp::HFlip,
             "vertical_flip" => FxOp::VFlip,
@@ -447,11 +515,8 @@ impl FxOp {
             FxOp::DirectionalBlur { dx, dy, .. } => fin(&[*dx, *dy]),
             FxOp::Unsharp { amount, threshold, .. } => fin(&[*amount, *threshold]),
             FxOp::Crop { x0, x1, y0, y1, feather } => fin(&[*x0, *x1, *y0, *y1, *feather]),
-            FxOp::Resample(r) => {
-                r.rect[0] != u32::MAX
-                    && r.opacity.is_finite()
-                    && r.inv.as_ref().is_none_or(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite() && v.abs() < 1e7))
-            }
+            FxOp::Resample(r) => r.gpu_ok(),
+            FxOp::MotionResample(v) => !v.is_empty() && v.len() <= MOTION_BLUR_MAX_SAMPLES && v.iter().all(Resample::gpu_ok),
             FxOp::Mirror { cx, cy, nx, ny } => fin(&[*cx, *cy, *nx, *ny]),
             FxOp::Offset { dx, dy, blend } => fin(&[*dx, *dy, *blend]),
             FxOp::AscCdl { slope, offset, power, sat } => fin(slope) && fin(offset) && fin(power) && sat.is_finite(),
@@ -614,6 +679,7 @@ impl FxOp {
                 *img = out;
                 img.scale_alpha(r.opacity);
             }
+            FxOp::MotionResample(samples) => motion_cpu(img, samples),
             FxOp::HFlip => {
                 let w = img.w;
                 img.px.par_chunks_mut(w * 4).for_each(|row| {
@@ -711,6 +777,68 @@ impl FxOp {
             }
         }
     }
+}
+
+impl Resample {
+    /// Whether the GPU shader reproduces this resample (no mip path, finite numbers).
+    fn gpu_ok(&self) -> bool {
+        self.rect[0] != u32::MAX
+            && self.opacity.is_finite()
+            && self.inv.as_ref().is_none_or(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite() && v.abs() < 1e7))
+    }
+}
+
+/// Motion blur: the mean of the resamples. Without mip samples every output pixel loops over the
+/// samples itself (what the GPU shader does); otherwise each sample is a whole `Resample` pass.
+fn motion_cpu(img: &mut Image, samples: &[Resample]) {
+    let n = samples.len().max(1) as f32;
+    if samples.iter().any(|r| r.rect[0] == u32::MAX) {
+        let mut acc = Image::new(img.w, img.h);
+        for r in samples {
+            let mut one = img.clone();
+            FxOp::Resample(r.clone()).apply(&mut one);
+            acc.px.par_iter_mut().zip(one.px.par_iter()).for_each(|(a, v)| *a += *v);
+        }
+        acc.px.par_iter_mut().for_each(|v| *v /= n);
+        *img = acc;
+        return;
+    }
+    let (w, h) = (img.w, img.h);
+    let src = std::mem::replace(img, Image::new(w, h));
+    // per sample: the inverse map, its destination rectangle (clamped like `resample_cpu`), opacity
+    let prepared: Vec<(Affine, [usize; 4], f32)> = samples
+        .iter()
+        .filter_map(|r| {
+            let inv = r.inv?;
+            let [x0, x1, y0, y1] = r.rect.map(|v| v as usize);
+            let (x1, y1) = (x1.min(w), y1.min(h));
+            Some((inv, [x0.min(x1), x1, y0.min(y1), y1], r.opacity))
+        })
+        .collect();
+    let (fw, fh) = (w as f64, h as f64);
+    img.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        let py = y as f64 + 0.5;
+        for x in 0..w {
+            let px = x as f64 + 0.5;
+            let mut acc = [0.0f32; 4];
+            for (inv, [x0, x1, y0, y1], op) in &prepared {
+                if x < *x0 || x >= *x1 || y < *y0 || y >= *y1 {
+                    continue;
+                }
+                let (u, v) = (inv.a * px + inv.c * py + inv.e, inv.b * px + inv.d * py + inv.f);
+                if u < -1.0 || v < -1.0 || u > fw + 1.0 || v > fh + 1.0 {
+                    continue;
+                }
+                let c = src.sample_bilinear(u as f32, v as f32);
+                for k in 0..4 {
+                    acc[k] += c[k] * op;
+                }
+            }
+            if let Some(o) = row.get_mut(x * 4..x * 4 + 4) {
+                o.copy_from_slice(&acc.map(|v| v / n));
+            }
+        }
+    });
 }
 
 /// The body of `Image::transformed` (no mip path) for a precomputed inverse and rectangle.

@@ -619,6 +619,9 @@ fn build_effects() -> Vec<EffectDef> {
                 ang("skew_axis", "Skew Axis", 0.0),
                 ang("rotation", "Rotation", 0.0),
                 f("opacity", "Opacity", 100.0, 0.0, 100.0, ""),
+                // Premiere: on by default, and a sequence's own shutter angle is 0°, so motion
+                // blur needs this off and a Shutter Angle above 0 (Pat's push-ins: 120–180°)
+                b("use_comp_shutter", "Use Composition's Shutter Angle", true),
                 f("shutter_angle", "Shutter Angle", 0.0, 0.0, 360.0, ""),
             ],
         ),

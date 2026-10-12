@@ -17,6 +17,10 @@ use crate::image::Image;
 pub struct FxCtx<'a> {
     /// Media time used to evaluate keyframes.
     pub t: Tick,
+    /// One sequence frame expressed in the same (effect) time as `t`: the span a 360° shutter
+    /// covers for motion blur (Transform's Shutter Angle). `Tick::ZERO` when unknown or frozen
+    /// (a frame hold with held filters): no motion blur.
+    pub frame: Tick,
     /// Working-image pixels per full-resolution clip pixel.
     pub px_scale: f32,
     /// Seconds since the clip start (for animated generators such as Noise/Strobe).
@@ -889,6 +893,7 @@ mod tests {
     fn cx() -> FxCtx<'static> {
         FxCtx {
             t: Tick::ZERO,
+            frame: filmcraft_time::Tick::ZERO,
             px_scale: 1.0,
             seconds: 0.0,
             timecode: "00:00:01:00",

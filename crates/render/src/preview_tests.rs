@@ -228,6 +228,7 @@ fn effect_costs() {
         let e = d.instance();
         let cx = FxCtx {
             t: Tick::ZERO,
+            frame: filmcraft_time::Tick::ZERO,
             px_scale: 1.0,
             seconds: 0.0,
             timecode: "00:00:00:00",

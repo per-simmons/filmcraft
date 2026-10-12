@@ -186,6 +186,7 @@ fn graded_stats(img: &Image, base: &EffectInstance, x: &[f32; 10], skin_protect:
     let mut g = img.clone();
     let cx = FxCtx {
         t: Tick::ZERO,
+        frame: filmcraft_time::Tick::ZERO,
         px_scale: g.w as f32 / 1920.0,
         seconds: 0.0,
         timecode: "",
@@ -355,6 +356,7 @@ mod tests {
         let mut g = img.clone();
         let cx = FxCtx {
             t: Tick::ZERO,
+            frame: filmcraft_time::Tick::ZERO,
             px_scale: 0.1,
             seconds: 0.0,
             timecode: "",

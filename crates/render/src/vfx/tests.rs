@@ -11,6 +11,7 @@ use super::*;
 fn cx() -> FxCtx<'static> {
     FxCtx {
         t: Tick::ZERO,
+        frame: filmcraft_time::Tick::ZERO,
         px_scale: 1.0,
         seconds: 0.0,
         timecode: "01:00:00:00",

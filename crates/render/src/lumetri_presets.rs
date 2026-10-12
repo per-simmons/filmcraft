@@ -222,6 +222,7 @@ pub fn thumbnail(preset: &LumetriPreset, w: usize, h: usize) -> Image {
     let mut img = preview_image(w, h);
     let cx = FxCtx {
         t: Tick::ZERO,
+        frame: filmcraft_time::Tick::ZERO,
         px_scale: w as f32 / 1920.0,
         seconds: 0.0,
         timecode: "",

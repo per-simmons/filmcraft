@@ -10,6 +10,10 @@ struct U {
     p1: vec4<f32>,
     p2: vec4<f32>,
     p3: vec4<f32>,
+    // Transform motion blur (`OP_MOTION_RESAMPLE`, i1.x samples): per sample two vec4s of the
+    // inverse map (a b c d, e f opacity valid) and its destination rectangle (x0 x1 y0 y1).
+    mb: array<vec4<f32>, 32>,
+    mr: array<vec4<u32>, 16>,
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -45,6 +49,7 @@ const OP_HFLIP: u32 = 26u;
 const OP_VFLIP: u32 = 27u;
 const OP_MIRROR: u32 = 28u;
 const OP_OFFSET: u32 = 29u;
+const OP_MOTION_RESAMPLE: u32 = 30u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -439,6 +444,26 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
                 return vec4(0.0);
             }
             return sample_bilinear(uu, vv) * m1.z;
+        }
+        case OP_MOTION_RESAMPLE: {
+            // `gpufx::motion_cpu`: the mean of the samples' resamples
+            let n = min(u.i1.x, 16u);
+            var acc = vec4(0.0);
+            for (var k = 0u; k < n; k++) {
+                let r = u.mr[k];
+                let m0 = u.mb[2u * k];
+                let m1 = u.mb[2u * k + 1u];
+                if m1.w == 0.0 || u32(p.x) < r.x || u32(p.x) >= r.y || u32(p.y) < r.z || u32(p.y) >= r.w {
+                    continue;
+                }
+                let uu = m0.x * pc.x + m0.z * pc.y + m1.x;
+                let vv = m0.y * pc.x + m0.w * pc.y + m1.y;
+                if uu < -1.0 || vv < -1.0 || uu > f32(s.x) + 1.0 || vv > f32(s.y) + 1.0 {
+                    continue;
+                }
+                acc += sample_bilinear(uu, vv) * m1.z;
+            }
+            return acc / f32(max(n, 1u));
         }
         case OP_HFLIP: {
             return ld(vec2(s.x - 1 - p.x, p.y));

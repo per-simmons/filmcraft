@@ -222,6 +222,7 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
             let mut adjusted = canvas.snapshot();
             let cx = effects::FxCtx {
                 t: mt,
+                frame: effect_frame(seq, item),
                 px_scale: opts.scale,
                 seconds: (t - item.start).seconds(),
                 timecode: &tc,
@@ -448,6 +449,7 @@ pub(crate) fn item_layer_ex(
         let env = vfx::ItemEnv { project, seq, item, t, opts, sources, want, layer_size: (layer.w, layer.h), layer_to_output: m, tc };
         let cx = effects::FxCtx {
             t: mt,
+            frame: effect_frame(seq, item),
             px_scale,
             seconds: (t - item.start).seconds(),
             timecode: tc,
@@ -492,6 +494,22 @@ fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f3
     let frame = src.video_frame(FrameRequest { time: video_source_time(item, t, src.info().frame_rate()), scale: want }).ok()?;
     let n = decimation(frame.width as f32, src_size.0 as f32 * want);
     Some((src, frame, n))
+}
+
+/// One sequence frame of `seq` in `item`'s effect time (the keyframe time base): the span a 360°
+/// shutter covers when a Transform effect motion-blurs. Speed changes scale it; a frame hold
+/// with held filters freezes the effects, so it is zero there (no blur).
+pub(crate) fn effect_frame(seq: &Sequence, item: &TrackItem) -> Tick {
+    if item.frame_hold.is_some() && item.hold_filters {
+        return Tick::ZERO;
+    }
+    let fd = seq.settings.frame_rate.frame_duration().0 as f64;
+    let speed = item.speed.abs();
+    if !speed.is_finite() {
+        return Tick::ZERO;
+    }
+    // (capped: a hostile speed must not overflow; 1000x is beyond any real retime)
+    Tick((fd * speed.min(1000.0)).round() as i64)
 }
 
 /// The media time to ask a source for the video frame a clip shows at timeline `t`. A reversed
@@ -663,6 +681,10 @@ mod lumetri_hdr_tests;
 #[cfg(test)]
 #[path = "adjustment_tests.rs"]
 mod adjustment_tests;
+
+#[cfg(test)]
+#[path = "motion_blur_tests.rs"]
+mod motion_blur_tests;
 
 #[cfg(test)]
 #[path = "mixer_tests.rs"]

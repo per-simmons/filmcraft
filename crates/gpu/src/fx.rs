@@ -49,6 +49,12 @@ const OP_HFLIP: u32 = 26;
 const OP_VFLIP: u32 = 27;
 const OP_MIRROR: u32 = 28;
 const OP_OFFSET: u32 = 29;
+const OP_MOTION_RESAMPLE: u32 = 30;
+
+/// Motion-blur samples the uniform holds (`fx.wgsl` `U.mb` / `U.mr`).
+const MB_SAMPLES: usize = filmcraft_render::gpufx::MOTION_BLUR_MAX_SAMPLES;
+// (`fx.wgsl` declares the arrays with this many samples)
+const _: () = assert!(MB_SAMPLES == 16);
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -90,6 +96,9 @@ struct Step {
     combine: bool,
     /// A blur pass of Unsharp Mask (the original stays untouched until the combine).
     unsharp_blur: bool,
+    /// Motion blur: per sample the inverse map, opacity and validity (a b c d, e f opacity valid)
+    /// and the destination rectangle (x0 x1 y0 y1).
+    mb: Vec<([f32; 8], [u32; 4])>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -97,7 +106,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, mb: Vec::new() }
 }
 
 /// Box passes along x (vertical = false) or y for the radii (radius 0 is a no-op on the CPU).
@@ -157,6 +166,18 @@ fn steps(op: &FxOp) -> Vec<Step> {
                 Some(m) => out.push(step(OP_RESAMPLE, r.rect, &[m.a as f32, m.b as f32, m.c as f32, m.d as f32, m.e as f32, m.f as f32, op, 1.0])),
                 None => out.push(step(OP_RESAMPLE, [0; 4], &[0.0; 8])),
             }
+        }
+        FxOp::MotionResample(samples) => {
+            let mut s = step(OP_MOTION_RESAMPLE, [samples.len().min(MB_SAMPLES) as u32, 0, 0, 0], &[]);
+            s.mb = samples
+                .iter()
+                .take(MB_SAMPLES)
+                .map(|r| match &r.inv {
+                    Some(m) => ([m.a as f32, m.b as f32, m.c as f32, m.d as f32, m.e as f32, m.f as f32, r.opacity, 1.0], r.rect),
+                    None => ([0.0; 8], [0; 4]),
+                })
+                .collect();
+            out.push(s);
         }
         FxOp::HFlip => out.push(step(OP_HFLIP, [0; 4], &[])),
         FxOp::VFlip => out.push(step(OP_VFLIP, [0; 4], &[])),
@@ -340,12 +361,24 @@ impl FxStage {
                 (true, Some(o)) => views.get(o)?,
                 _ => dummy,
             };
-            let mut bytes = Vec::with_capacity(96);
+            let mut bytes = Vec::with_capacity(96 + MB_SAMPLES * 48);
             for v in [s.code, w, h, 0].iter().chain(&s.i1) {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
             for v in &s.p {
                 bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            // every op's uniform has the motion-blur arrays (zero unless it is a motion blur)
+            let none = ([0.0f32; 8], [0u32; 4]);
+            for k in 0..MB_SAMPLES {
+                for v in s.mb.get(k).unwrap_or(&none).0 {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            for k in 0..MB_SAMPLES {
+                for v in s.mb.get(k).unwrap_or(&none).1 {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
             }
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("fx-u"),

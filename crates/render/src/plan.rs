@@ -308,6 +308,7 @@ fn push_item(
             let tc = "";
             let cx = crate::effects::FxCtx {
                 t: mt,
+                frame: crate::effect_frame(seq, item),
                 px_scale,
                 seconds: (t - item.start).seconds(),
                 timecode: tc,
