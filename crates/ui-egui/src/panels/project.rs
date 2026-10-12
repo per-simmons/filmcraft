@@ -94,6 +94,8 @@ pub struct ProjectPanelUi {
     pub rename: Option<Rename>,
     pub dialog: Option<ProjectDialog>,
     pub hover: Option<Hover>,
+    /// An item or bin to scroll into view on the next frame (a new copy from Duplicate / Paste).
+    pub reveal: Option<u64>,
 }
 
 /// Which panel instance a view belongs to.

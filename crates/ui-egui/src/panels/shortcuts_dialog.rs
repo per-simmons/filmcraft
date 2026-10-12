@@ -91,6 +91,26 @@ fn exec(app: &mut FilmcraftApp, cmd: &str, params: Value) -> Option<Value> {
     }
 }
 
+/// The status line after an import: the preset's name and, for a Premiere `.kys` file, what was
+/// carried over and what has no FilmCraft counterpart.
+fn import_message(r: &Value) -> String {
+    let name = r["name"].as_str().unwrap_or("");
+    if r["format"] != json!("premiere-kys") {
+        return format!("Imported “{name}”");
+    }
+    let unmapped = r["unmapped"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut msg = format!("Imported “{name}”: {} of {} Premiere shortcuts", r["mapped"].as_u64().unwrap_or(0), r["total"].as_u64().unwrap_or(0));
+    if !unmapped.is_empty() {
+        let first: Vec<String> = unmapped
+            .iter()
+            .take(4)
+            .map(|u| format!("{} ({})", u["command"].as_str().unwrap_or("").trim_start_matches("cmd."), u["keys"].as_str().unwrap_or("")))
+            .collect();
+        msg.push_str(&format!("; {} not in FilmCraft: {}{}", unmapped.len(), first.join(", "), if unmapped.len() > 4 { ", …" } else { "" }));
+    }
+    msg
+}
+
 /// Assign a recorded chord.
 fn assign(app: &mut FilmcraftApp, command: &str, keys: &str, add: bool) {
     let panel = app.shortcut_editor.panel().map(str::to_string);
@@ -251,11 +271,12 @@ fn header(app: &mut FilmcraftApp, ui: &mut egui::Ui, t: &Tokens) {
             }
         }
         if small_button(app, ui, "shortcuts.import", "Import…", true) {
-            let picked = app.hooks.pick_open_file.as_mut().and_then(|f| f("Keyboard Shortcuts", &["json"]));
+            // FilmCraft presets (.json) and Premiere Pro keyboard shortcut files (.kys)
+            let picked = app.hooks.pick_open_file.as_mut().and_then(|f| f("Keyboard Shortcuts", &["json", "kys"]));
             match picked {
                 Some(path) => {
                     if let Some(r) = exec(app, "shortcuts.import", json!({"path": path})) {
-                        app.shortcut_editor.message = format!("Imported “{}”", r["name"].as_str().unwrap_or(""));
+                        app.shortcut_editor.message = import_message(&r);
                     }
                 }
                 None => app.shortcut_editor.message = "Import: no file chosen (agents: shortcuts.import {path})".into(),

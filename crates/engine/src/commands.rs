@@ -1162,21 +1162,7 @@ fn build() -> Vec<CommandSpec> {
             s.state.gap_selection.clear();
             Ok(Value::Null)
         }),
-        cmd!("edit.duplicate", "Duplicate", ["Edit"], Some("Cmd+Shift+/"), "{}", has_project_selection, |s, _| {
-            let sel = s.state.project_selection.clone();
-            let ids = s.edit("Duplicate", |p, st| {
-                let mut out = Vec::new();
-                for id in sel {
-                    if let Some(it) = p.item(id).cloned() {
-                        let nid = p.add_item(&format!("{} Copy", it.name), it.label, it.kind.clone(), None);
-                        out.push(nid);
-                    }
-                }
-                st.project_selection = out.clone();
-                Ok(out)
-            })?;
-            Ok(json!({"items": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
-        }),
+        cmd!("edit.duplicate", "Duplicate", ["Edit"], Some("Cmd+Shift+/"), r#"{"items":[id]?}"#, has_project_selection, crate::project_clipboard::duplicate),
         cmd!("edit.label", "Label", [], None, r#"{"label":"Violet|Iris|…"}"#, always, |s, p| {
             let l = str_p(p, "label").and_then(Label::from_name).ok_or_else(|| bad("edit.label", "unknown label"))?;
             let clips = s.state.selection.clone();
@@ -2000,6 +1986,21 @@ fn build() -> Vec<CommandSpec> {
         cmd!("trim.selectNearest", "Select Nearest Edit Point", [], None, r#"{"kind":"rippleIn|rippleOut|roll|trimIn|trimOut"}"#, has_seq, |s, p| {
             crate::trim::select_nearest(s, p)
         }),
+        cmd!("trim.selectNearestRippleIn", "Select Nearest Edit Point as Ripple In", [], None, "{}", has_seq, |s, _| {
+            crate::trim::select_nearest(s, &json!({"kind": "rippleIn"}))
+        }),
+        cmd!("trim.selectNearestRippleOut", "Select Nearest Edit Point as Ripple Out", [], None, "{}", has_seq, |s, _| {
+            crate::trim::select_nearest(s, &json!({"kind": "rippleOut"}))
+        }),
+        cmd!("trim.selectNearestRoll", "Select Nearest Edit Point as Roll", [], None, "{}", has_seq, |s, _| {
+            crate::trim::select_nearest(s, &json!({"kind": "roll"}))
+        }),
+        cmd!("trim.selectNearestTrimIn", "Select Nearest Edit Point as Trim In", [], None, "{}", has_seq, |s, _| {
+            crate::trim::select_nearest(s, &json!({"kind": "trimIn"}))
+        }),
+        cmd!("trim.selectNearestTrimOut", "Select Nearest Edit Point as Trim Out", [], None, "{}", has_seq, |s, _| {
+            crate::trim::select_nearest(s, &json!({"kind": "trimOut"}))
+        }),
         cmd!("trim.edit", "Trim Edit", ["Sequence"], Some("Shift+T"), "{}", has_seq, |s, _| {
             if s.state.edit_points.is_empty() {
                 crate::trim::select_nearest(s, &json!({"kind": "roll"}))
@@ -2585,6 +2586,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::voiceover::commands());
     v.extend(crate::keyboard::commands());
     v.extend(crate::project_panel::commands());
+    v.extend(crate::project_clipboard::commands());
     v.extend(crate::media_browser::commands());
     // Edit ▸ Label ▸ <colour>, Paste Attributes, subclips, Video / Audio Options, Replace With Clip…
     // and their menu order

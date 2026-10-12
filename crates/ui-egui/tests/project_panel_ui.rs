@@ -626,3 +626,75 @@ fn media_browser_drag_imports_into_the_project_panel() {
     assert_eq!(d.app().session.project.items.len(), n0 + 1, "kept after a drop on the Timeline");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Premiere's Project panel clipboard: with the panel focused Cmd+C / Cmd+V copy a sequence into
+/// its bin as "<name> Copy", Cmd+X / Cmd+V move, Edit ▸ Duplicate (Cmd+Shift+/) puts the copy
+/// right below the original with no dialog; the copy is selected and scrolled into view. With the
+/// Timeline focused the same keys copy and paste clips.
+#[test]
+fn project_panel_copy_paste_and_duplicate_like_premiere() {
+    let mut d = project_driver();
+    d.exec("project.view.set", json!({"view": "list"}));
+    let (main, seqs) = {
+        let p = &d.app().session.project;
+        let main = p.items.values().find(|i| i.name == "Main Edit").unwrap().id;
+        (main, p.bin_of(main).unwrap())
+    };
+    d.app().ui.expanded_bins.retain(|b| *b != seqs.0);
+    d.exec("project.select", json!({"items": [main.0]}));
+    d.ok("ui.set", json!({"focused": "Project"}));
+    let n = d.app().session.project.items.len();
+    d.key("Cmd+C");
+    assert_eq!(d.app().session.project.items.len(), n, "copy changes nothing");
+    d.key("Cmd+V");
+    d.frames(3);
+    let copy = {
+        let app = d.app();
+        assert_eq!(app.session.project.items.len(), n + 1, "{}", app.ui.status);
+        let copy = app.session.project.items.values().find(|i| i.name == "Main Edit Copy").expect("Main Edit Copy").id;
+        assert_eq!(app.session.project.bin_of(copy), Some(seqs), "pasted into the original's bin");
+        assert_eq!(app.session.state.project_selection, vec![copy]);
+        assert!(app.ui.expanded_bins.contains(&seqs.0), "its bin opens");
+        assert_eq!(app.ui.project_panel.reveal, None, "scrolled into view");
+        assert!(app.session.state.clipboard.is_empty(), "the timeline clipboard is not involved");
+        copy
+    };
+    assert!(d.has(&format!("project.item.{}", copy.0)), "the copy's row is shown");
+    // Duplicate: no dialog, right below the original, selected
+    d.exec("project.select", json!({"items": [main.0]}));
+    d.key("Cmd+Shift+/");
+    d.frames(2);
+    {
+        let app = d.app();
+        assert!(app.dialog.is_none() && app.ui.project_panel.dialog.is_none(), "no confirmation");
+        let dup = app.session.project.items.values().find(|i| i.name == "Main Edit Copy 01").expect("duplicate").id;
+        let bin = app.session.project.root.find_bin(seqs).unwrap();
+        let order: Vec<ItemId> = bin.children.iter().filter_map(|e| if let BinEntry::Item(i) = e { Some(*i) } else { None }).collect();
+        let at = order.iter().position(|i| *i == main).unwrap();
+        assert_eq!(order.get(at + 1), Some(&dup));
+        assert_eq!(app.session.state.project_selection, vec![dup]);
+    }
+    // Cut / Paste moves into the selected bin
+    let (footage, _) = d.footage();
+    d.exec("project.select", json!({"items": [copy.0]}));
+    d.key("Cmd+X");
+    d.app().session.state.project_selection.clear();
+    d.app().ui.project_panel.selected_bin = Some(footage);
+    d.key("Cmd+V");
+    assert_eq!(d.app().session.project.bin_of(copy).map(|b| b.0), Some(footage));
+    // the Edit menu follows the focus too
+    let items = d.ok("ui.menu.list", json!({}));
+    let copy_item = items.as_array().unwrap().iter().find(|i| i["id"] == "edit.copy").unwrap().clone();
+    assert_eq!(copy_item["enabled"], json!(true), "Edit ▸ Copy is available for the selected bin");
+    // Timeline focus: the same keys copy and paste clips
+    let clips = |d: &mut Driver| d.app().session.active_sequence().unwrap().all_tracks().map(|t| t.items.len()).sum::<usize>();
+    let before = clips(&mut d);
+    let first = d.app().session.active_sequence().unwrap().video_tracks[0].items[0].id;
+    d.app().session.state.selection = vec![first];
+    d.ok("ui.set", json!({"focused": "Timeline"}));
+    let items_before = d.app().session.project.items.len();
+    d.key("Cmd+C");
+    d.key("Cmd+V");
+    assert!(clips(&mut d) > before, "clips pasted on the timeline");
+    assert_eq!(d.app().session.project.items.len(), items_before, "no project items pasted");
+}
