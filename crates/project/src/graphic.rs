@@ -232,6 +232,9 @@ pub struct LayerSpec {
     pub content: LayerContent,
     pub appearance: Appearance,
     pub transform: LayerTransform,
+    /// Staggered text animation and the clip time it is shown at (text layers with an animation;
+    /// [`eval_layer`] uses its time argument as the clip time and knows no clip length).
+    pub anim: Option<crate::text_anim::AnimClock>,
 }
 
 fn val(e: &EffectInstance, id: &str, t: Tick) -> ParamValue {
@@ -341,6 +344,10 @@ pub fn eval_layer(e: &EffectInstance, t: Tick, frame: (u32, u32)) -> Option<Laye
             scale: Vec2::new(sw, s),
             rotation: ff(e, "rotation", t) as f64,
             opacity: (ff(e, "opacity", t) / 100.0).clamp(0.0, 1.0),
+        },
+        anim: match e.effect.as_str() {
+            TEXT_LAYER => e.layer.as_ref().and_then(|x| x.anim.clone()).map(|anim| crate::text_anim::AnimClock { anim, time: t, length: None }),
+            _ => None,
         },
     })
 }

@@ -20,6 +20,7 @@ pub mod keyframe;
 pub mod mask;
 pub mod mixer;
 pub mod multicam;
+pub mod text_anim;
 pub mod transcript;
 pub mod vtransition;
 

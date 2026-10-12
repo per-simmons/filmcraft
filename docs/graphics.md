@@ -239,6 +239,31 @@ Automation ids: `essentialGraphics.tab.browse|edit`, `gfxTemplates.search`, `gfx
 `exportTemplate.*`, `replaceFonts.*`; `ui.set {"gfxTemplates": {...}, "gfxEdit": {...}}` sets the
 panel state and the Type-tool selection.
 
+## Staggered text animation, word boxes and emphasis titles
+
+A text layer can animate **per character, word or line** without keyframes or extra layers: the
+animation is stored on the layer (`LayerExtra.anim`, `filmcraft_project::text_anim`), saves with
+the project and in `.fcgt` templates, copies with the clip and follows text edits. The renderer
+splits the laid-out text into units (`render::graphic_clip::text_units`) and draws each one with its
+own offset, opacity and scale; a settled animation draws exactly like the still layer (and is
+cached like one). Timing is exact `Tick` time on the clip: the entrance counts from the clip start,
+the exit ends at the clip end, so trimming keeps both.
+
+| Command | Params |
+|---|---|
+| `graphics.animateText` | `clip`, `layer`; `preset` (`word-rise`, `char-rise`, `line-rise`, `whole-rise`, `none`); `unit` (char / word / line / whole); entrance: `staggerFrames` (offset between unit starts; or `…Seconds`, or ticks), `durationFrames` (each unit), `delayFrames`, `totalFrames` (instead of a stagger: the last unit lands then), `rise` (px; starts below and rises into place), `driftX`, `fade` (bool or %), `scale` (start %, 100 = none), `easeIn` / `easeOut` (Bézier influences, %), `order` (forward / backward / centerOut / random + `seed`); `outro`: `{durationFrames, staggerFrames, delayFrames, rise, fade, scale, easeIn, easeOut, order}`, `true` or `false`; `off`. Returns the stored animation and each unit's start / end (clip and sequence ticks and frames) |
+| `graphics.textLayout` | (query) `clip`, `layer`, `unit` (word / char / line / whole), a time (`time`, `frame`, `seconds`, `timecode`; default the playhead), `animated` (false: boxes at rest; true: where the animation has them then, with `opacity`). Returns every unit's `rect` `[x, y, w, h]` in **sequence pixels** (through the clip's Motion), `center`, `baselineY`; the lines with their widths; the block rectangle; `balance` (`lineWidths`, `ratio` = narrowest / widest, `orphan` = a lone short last word); `safe` (inside the frame / action-safe / title-safe) |
+| `graphics.emphasisTitle` | `text`, `placement` (lowerCenter: baseline at 80 % of the height; upperLeft / upperRight: 7 % in from the side, top at 17 %; center; leftThird / rightThird: centred in that third, for a push-in that leaves room opposite), `size` (default 222 at 2160 lines, scaled to the frame), `font` (default Bodoni 72 Bold when the system has it, else the bundled Noto Serif Bold), `tracking` (15), `caps` (true), `maxLines` (3), `maxWidth`, `color` (white), `animate` (a preset, `graphics.animateText` params, or false; default `word-rise`), `seconds` (5), placement `time` / `frame`, `track`. White fill, no box, stroke, shadow or rotation. Line breaks are **balanced**: the fewest lines that fit `maxWidth`, with the widest line as narrow as possible (no stranded last word). One undo step; returns the lines, font used, the word layout and the animation schedule |
+| `graphics.textAnimationPresets` | (query) the presets with their settings |
+
+The `word-rise` preset: words rise 36 px and fade in, 20 frames each, 14 frames apart (60 fps
+frames, so the phrase lands at frame 48 at any sequence rate), with a 60 / 80 % Bézier ease; all
+words fade out together over the last 18 frames. The built-in templates **Emphasis – Serif Caps**
+and **Emphasis – Serif Word Rise** (Titles) are the same look as `.fcgt` templates.
+
+The **Text Animator** transition stays a grid reveal over the picture (it sees only pixels, so it
+cannot know where words are); use `graphics.animateText` for word, character and line reveals.
+
 ## Captions, source graphics and fonts
 
 | Command | Menu | Params |

@@ -12,8 +12,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_project::graphic::{LayerContent, LayerSpec, ShapeProps, TextProps, eval_layer};
+use filmcraft_project::graphic::{Appearance, LayerContent, LayerSpec, LayerTransform, ShapeProps, TextProps, eval_layer};
 use filmcraft_project::graphic_design::{GraphicMeta, PinNode, remap_time, resolve_pins, roll_offset};
+use filmcraft_project::text_anim::{TextUnit, UnitState, unit_state};
 use filmcraft_project::{EffectInstance, TrackItem};
 use filmcraft_text::raster::{Xform, apply, fill_into, xform_scale};
 use filmcraft_text::{Align, Caps, Layout, Mask, ParagraphStyle, StrokeKind, StyleRun, TextStyle, layout_rich, mask, render};
@@ -191,24 +192,40 @@ fn over_mask(px: &mut [f32], m: &Mask, c: [f32; 4]) {
     });
 }
 
-/// Rasterise one layer with layer→device transform `m`, clipped to a `cw`×`ch` canvas.
+/// Rasterise one layer with layer→device transform `m`, clipped to a `cw`×`ch` canvas. A text
+/// layer with a staggered animation ([`LayerSpec::anim`]) draws each word / character / line at
+/// its animated offset, opacity and scale.
 pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option<LayerRaster> {
+    if !spec.enabled || spec.transform.opacity <= 0.0 {
+        return None;
+    }
+    match &spec.content {
+        LayerContent::Text(t) => {
+            let l = text_layout(t);
+            if let Some(units) = animated_units(spec, &l) {
+                return raster_animated(spec, &l, &units, m, cw, ch);
+            }
+            raster_with(spec, Some(&l), m, cw, ch)
+        }
+        LayerContent::Shape(_) => raster_with(spec, None, m, cw, ch),
+    }
+}
+
+/// [`raster_layer`] with the text already laid out (`text` is None for shapes).
+fn raster_with(spec: &LayerSpec, text: Option<&Layout>, m: &Xform, cw: usize, ch: usize) -> Option<LayerRaster> {
     if !spec.enabled || spec.transform.opacity <= 0.0 {
         return None;
     }
     let s = xform_scale(m).max(1e-6);
     let ap = &spec.appearance;
-    let text = match &spec.content {
-        LayerContent::Text(t) => {
-            let l = text_layout(t);
-            if l.glyphs.is_empty() && l.underlines.is_empty() && ap.background.is_none() {
-                return None;
-            }
-            Some(l)
-        }
-        LayerContent::Shape(_) => None,
-    };
-    let lb = match &text {
+    if let Some(l) = text
+        && l.glyphs.is_empty()
+        && l.underlines.is_empty()
+        && ap.background.is_none()
+    {
+        return None;
+    }
+    let lb = match text {
         Some(l) => l.bounds,
         None => layer_local_bounds(spec),
     };
@@ -229,7 +246,7 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
             }
         })
         .fold(0.0f32, f32::max);
-    let overhang = text.as_ref().map_or(0.0, |l| l.glyphs.iter().map(|g| g.size).fold(0.0f32, f32::max) * 0.35);
+    let overhang = text.map_or(0.0, |l| l.glyphs.iter().map(|g| g.size).fold(0.0f32, f32::max) * 0.35);
     let mut bb = bbox_of(m, lb, overhang + stroke_out + 2.0 / s);
     if let Some((_, pad, _)) = ap.background {
         bb = union(bb, bbox_of(m, lb, pad + 1.0 / s));
@@ -255,7 +272,7 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
         return None;
     }
     let mut cover = Mask::new(w, h);
-    if let Some(l) = &text {
+    if let Some(l) = text {
         render::draw(l, m, &mut cover, (x0, y0));
     }
     if let Some(p) = &shape {
@@ -300,11 +317,11 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
             LayerContent::Text(t) => t.runs.iter().map(|(_, s)| s.fill).collect(),
             _ => Vec::new(),
         };
-        match &text {
+        match text {
             Some(l) if run_fills.iter().any(Option::is_some) => {
                 let mut groups: Vec<([f32; 4], Vec<u16>)> = Vec::new();
                 for r in 0..=run_fills.len() {
-                    let col = if r == 0 { c } else { run_fills[r - 1].unwrap_or(c) };
+                    let col = if r == 0 { c } else { run_fills.get(r - 1).copied().flatten().unwrap_or(c) };
                     match groups.iter_mut().find(|g| g.0 == col) {
                         Some(g) => g.1.push(r as u16),
                         None => groups.push((col, vec![r as u16])),
@@ -333,6 +350,162 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
     Some(LayerRaster { x: x0, y: y0, img: Image { w, h, px } })
 }
 
+/// One animation unit of a laid-out text (a character, word, line or the whole block).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextUnitBox {
+    /// Byte range of the unit in the layer's text.
+    pub range: std::ops::Range<usize>,
+    /// Line index (the first line for [`TextUnit::Whole`]).
+    pub line: usize,
+    /// Logical box `[x0, y0, x1, y1]` in layer pixels: caret extent × the line's ascent / descent.
+    pub rect: [f32; 4],
+    /// Baseline (layer pixels) of the unit's line.
+    pub baseline: f32,
+    /// Indices into [`Layout::glyphs`].
+    pub glyphs: Vec<usize>,
+}
+
+/// Split a laid-out text into units: non-space characters, words (runs of non-space characters
+/// within a line), lines (without surrounding spaces; empty lines are skipped) or the whole
+/// block. Vertical text has only the whole-block unit.
+pub fn text_units(l: &Layout, text: &str, unit: TextUnit) -> Vec<TextUnitBox> {
+    let unit = if l.vertical { TextUnit::Whole } else { unit };
+    let mut out: Vec<TextUnitBox> = Vec::new();
+    for (li, line) in l.lines.iter().enumerate() {
+        let Some(lt) = text.get(line.range.clone()) else { continue };
+        let base = line.range.start;
+        let mut pieces: Vec<std::ops::Range<usize>> = Vec::new();
+        match unit {
+            TextUnit::Char => {
+                for (b, c) in lt.char_indices().filter(|(_, c)| !c.is_whitespace()) {
+                    pieces.push(base + b..base + b + c.len_utf8());
+                }
+            }
+            TextUnit::Word => {
+                let mut start: Option<usize> = None;
+                for (b, c) in lt.char_indices() {
+                    match (c.is_whitespace(), start) {
+                        (false, None) => start = Some(b),
+                        (true, Some(a)) => {
+                            pieces.push(base + a..base + b);
+                            start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(a) = start {
+                    pieces.push(base + a..base + lt.len());
+                }
+            }
+            TextUnit::Line | TextUnit::Whole => {
+                let lead = lt.len() - lt.trim_start().len();
+                let trimmed = lt.trim();
+                if !trimmed.is_empty() {
+                    pieces.push(base + lead..base + lead + trimmed.len());
+                }
+            }
+        }
+        let (top, bot) = (line.baseline - line.ascent, line.baseline + line.descent);
+        for r in pieces {
+            let xs = line.carets.iter().filter(|(b, _)| *b >= r.start && *b <= r.end).map(|c| c.1);
+            let (mut x0, mut x1) = xs.fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
+            let glyphs: Vec<usize> = (line.glyphs.start..line.glyphs.end.min(l.glyphs.len()))
+                .filter(|&g| l.glyphs.get(g).is_some_and(|g| g.cluster >= r.start && g.cluster < r.end))
+                .collect();
+            if x0 > x1 {
+                // no caret stops (should not happen): fall back to the glyph origins
+                for g in glyphs.iter().filter_map(|&g| l.glyphs.get(g)) {
+                    x0 = x0.min(g.x);
+                    x1 = x1.max(g.x + g.size * 0.5);
+                }
+            }
+            if x0 > x1 {
+                continue;
+            }
+            out.push(TextUnitBox { range: r, line: li, rect: [x0, top, x1, bot], baseline: line.baseline, glyphs });
+        }
+    }
+    if unit == TextUnit::Whole && !out.is_empty() {
+        let mut all = out.remove(0);
+        for u in out.drain(..) {
+            all.rect = [all.rect[0].min(u.rect[0]), all.rect[1].min(u.rect[1]), all.rect[2].max(u.rect[2]), all.rect[3].max(u.rect[3])];
+            all.range = all.range.start.min(u.range.start)..all.range.end.max(u.range.end);
+            all.glyphs.extend(u.glyphs);
+        }
+        // vertical text and anything the line walk missed: every glyph moves with the block
+        all.glyphs = (0..l.glyphs.len()).collect();
+        out.push(all);
+    }
+    out
+}
+
+/// The units of an animated text layer with their state now, or None when the layer has no
+/// animation or every unit is at rest (then it draws exactly like a still layer).
+pub fn animated_units(spec: &LayerSpec, l: &Layout) -> Option<Vec<(TextUnitBox, UnitState)>> {
+    let clock = spec.anim.as_ref()?;
+    let LayerContent::Text(t) = &spec.content else { return None };
+    let units = text_units(l, &t.text, clock.anim.unit);
+    let n = units.len();
+    let v: Vec<(TextUnitBox, UnitState)> = units.into_iter().enumerate().map(|(i, u)| (u, unit_state(&clock.anim, i, n, clock.time, clock.length))).collect();
+    if v.iter().all(|(_, st)| st.is_rest()) { None } else { Some(v) }
+}
+
+/// Layer pixels of a unit → layer pixels as animated (scaled about the unit's centre, then
+/// offset).
+pub fn unit_matrix(rect: [f32; 4], st: &UnitState) -> Affine {
+    let (cx, cy) = (((rect[0] + rect[2]) * 0.5) as f64, ((rect[1] + rect[3]) * 0.5) as f64);
+    let k = st.scale as f64;
+    Affine::translate(cx + st.offset[0] as f64, cy + st.offset[1] as f64).then_apply(&Affine::scale(k, k)).then_apply(&Affine::translate(-cx, -cy))
+}
+
+/// Draw an animated text layer: the background (if any) stays put; every visible unit is drawn
+/// with its own transform and opacity.
+fn raster_animated(spec: &LayerSpec, l: &Layout, units: &[(TextUnitBox, UnitState)], m: &Xform, cw: usize, ch: usize) -> Option<LayerRaster> {
+    let mut parts: Vec<LayerRaster> = Vec::new();
+    if spec.appearance.background.is_some() {
+        let empty = Layout { glyphs: Vec::new(), lines: Vec::new(), underlines: Vec::new(), underline_runs: Vec::new(), ..l.clone() };
+        let bg_only = LayerSpec { appearance: Appearance { fill: None, strokes: Vec::new(), ..spec.appearance.clone() }, ..spec.clone() };
+        parts.extend(raster_with(&bg_only, Some(&empty), m, cw, ch));
+    }
+    let unit_spec = LayerSpec { appearance: Appearance { background: None, ..spec.appearance.clone() }, anim: None, ..spec.clone() };
+    let lm = Affine { a: m[0] as f64, b: m[1] as f64, c: m[2] as f64, d: m[3] as f64, e: m[4] as f64, f: m[5] as f64 };
+    for (u, st) in units {
+        if st.alpha <= 0.0 || st.scale <= 1e-6 {
+            continue;
+        }
+        let glyphs: Vec<_> = u.glyphs.iter().filter_map(|&g| l.glyphs.get(g).copied()).collect();
+        let mut underlines = Vec::new();
+        let mut underline_runs = Vec::new();
+        for (k, r) in l.underlines.iter().enumerate() {
+            let mid = (r[0] + r[2]) * 0.5;
+            if mid >= u.rect[0] && mid <= u.rect[2] && r[1] >= u.rect[1] - 1.0 && r[1] <= u.rect[3] + l.lines.get(u.line).map_or(0.0, |x| x.descent) {
+                underlines.push(*r);
+                underline_runs.push(l.underline_runs.get(k).copied().unwrap_or(0));
+            }
+        }
+        if glyphs.is_empty() && underlines.is_empty() {
+            continue;
+        }
+        let sub = Layout { glyphs, lines: Vec::new(), underlines, underline_runs, bounds: u.rect, ..l.clone() };
+        let us = LayerSpec { transform: LayerTransform { opacity: spec.transform.opacity * st.alpha, ..spec.transform.clone() }, ..unit_spec.clone() };
+        let um = xform(&lm.then_apply(&unit_matrix(u.rect, st)));
+        parts.extend(raster_with(&us, Some(&sub), &um, cw, ch));
+    }
+    let x0 = parts.iter().map(|r| r.x).min()?;
+    let y0 = parts.iter().map(|r| r.y).min()?;
+    let x1 = parts.iter().map(|r| r.x.saturating_add(r.img.w as i32)).max()?;
+    let y1 = parts.iter().map(|r| r.y.saturating_add(r.img.h as i32)).max()?;
+    let (w, h) = ((x1 - x0).max(1) as usize, (y1 - y0).max(1) as usize);
+    if w.saturating_mul(h) > 64 << 20 {
+        return None;
+    }
+    let mut img = Image::new(w, h);
+    for r in &parts {
+        composite_raster(&mut img, r, -x0, -y0);
+    }
+    Some(LayerRaster { x: x0, y: y0, img })
+}
+
 type Cache = Mutex<HashMap<u64, (u64, Option<Arc<LayerRaster>>)>>;
 
 fn raster_cache() -> &'static Cache {
@@ -343,6 +516,29 @@ fn raster_cache() -> &'static Cache {
 /// [`raster_layer`] through a small cache (static titles re-composite without re-rasterising).
 pub fn raster_layer_cached(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option<Arc<LayerRaster>> {
     let mut hs = std::collections::hash_map::DefaultHasher::new();
+    // an animated text layer is keyed by what its units look like, not by the clock: a held
+    // title re-composites from the cache, and a finished animation is the plain layer
+    let settled;
+    let spec = match (&spec.anim, &spec.content) {
+        (Some(_), LayerContent::Text(t)) => {
+            let l = text_layout(t);
+            match animated_units(spec, &l) {
+                Some(units) => {
+                    if spec.appearance.background.is_none() && units.iter().all(|(_, st)| st.alpha <= 0.0) {
+                        return None;
+                    }
+                    units.iter().for_each(|(u, st)| format!("{:?}{:?}", u.glyphs, st).hash(&mut hs));
+                    format!("{:?}", LayerSpec { anim: None, ..spec.clone() }).hash(&mut hs);
+                    spec
+                }
+                None => {
+                    settled = LayerSpec { anim: None, ..spec.clone() };
+                    &settled
+                }
+            }
+        }
+        _ => spec,
+    };
     format!("{spec:?}").hash(&mut hs);
     m.iter().for_each(|v| v.to_bits().hash(&mut hs));
     (cw, ch).hash(&mut hs);
@@ -487,6 +683,14 @@ pub fn item_layer_specs(item: &TrackItem, mt: Tick, canvas: (u32, u32)) -> Vec<(
     apply_pins(&mut specs, canvas);
     if let Some(meta) = item.graphic.as_deref() {
         apply_roll(meta, &mut specs, u, d, canvas);
+    }
+    // staggered text animations run on clip time: the entrance from the clip start, the exit
+    // up to the clip end (unaffected by Responsive Design – Time remapping)
+    for s in specs.iter_mut() {
+        if let Some(c) = s.anim.as_mut() {
+            c.time = u;
+            c.length = Some(d);
+        }
     }
     idx.into_iter().zip(specs).collect()
 }
@@ -739,6 +943,143 @@ mod tests {
         assert!((big.get(200, 110)[3] - 0.5).abs() < 0.02);
         let q = layer_quad(&eval_layer(&find_effect("graphic_shape").unwrap().instance(), Tick::ZERO, (200, 200)).unwrap());
         assert!((q[0].x - (100.0 - 200.0)).abs() < 1e-6 && (q[2].y - (100.0 + 100.0)).abs() < 1e-6);
+    }
+
+    /// "NO EXPERIENCE REQUIRED" with the word-rise preset in a 5 s clip on a 1200×300 canvas.
+    fn word_rise_item(unit: Option<filmcraft_project::text_anim::TextUnit>) -> TrackItem {
+        use filmcraft_project::graphic_design::LayerExtra;
+        let mut e = new_text_layer("NO EXPERIENCE REQUIRED", Vec2::new(40.0, 200.0), 80.0);
+        let mut anim = filmcraft_project::text_anim::preset("word-rise").unwrap();
+        if let Some(u) = unit {
+            anim.unit = u;
+        }
+        e.layer = Some(Box::new(LayerExtra { anim: Some(anim), ..Default::default() }));
+        graphic_item(vec![e])
+    }
+
+    fn render_at(item: &TrackItem, t: Tick) -> Image {
+        let mut img = Image::new(1200, 300);
+        render_graphic(item, t, (1200, 300), &Affine::IDENTITY, &mut img);
+        img
+    }
+
+    /// Ink (alpha > `thr`) bounding box within columns `x0..x1`.
+    fn ink_in(img: &Image, x0: f32, x1: f32, thr: f32) -> Option<[usize; 4]> {
+        let mut b: Option<[usize; 4]> = None;
+        for y in 0..img.h {
+            for x in (x0.max(0.0) as usize)..(x1.min(img.w as f32) as usize) {
+                if img.get(x, y)[3] > thr {
+                    b = Some(match b {
+                        Some(a) => [a[0].min(x), a[1].min(y), a[2].max(x), a[3].max(y)],
+                        None => [x, y, x, y],
+                    });
+                }
+            }
+        }
+        b
+    }
+
+    fn max_alpha(img: &Image, x0: f32, x1: f32) -> f32 {
+        let mut m = 0.0f32;
+        for y in 0..img.h {
+            for x in (x0.max(0.0) as usize)..(x1.min(img.w as f32) as usize) {
+                m = m.max(img.get(x, y)[3]);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn words_enter_one_by_one_and_rise_into_place() {
+        use filmcraft_project::text_anim::frames60;
+        let item = word_rise_item(None);
+        let spec = item_layer_specs(&item, Tick::ZERO, (1200, 300)).remove(0).1;
+        let LayerContent::Text(t) = &spec.content else { unreachable!() };
+        let l = text_layout(t);
+        let units = text_units(&l, &t.text, TextUnit::Word);
+        assert_eq!(units.iter().map(|u| &t.text[u.range.clone()]).collect::<Vec<_>>(), vec!["NO", "EXPERIENCE", "REQUIRED"]);
+        // word columns in canvas pixels (the layer origin is at x = 40)
+        let col = |i: usize| (40.0 + units[i].rect[0] - 2.0, 40.0 + units[i].rect[2] + 2.0);
+        let rest = render_at(&item, frames60(120));
+        let still = {
+            let mut img = Image::new(1200, 300);
+            let plain = new_text_layer("NO EXPERIENCE REQUIRED", Vec2::new(40.0, 200.0), 80.0);
+            render_graphic(&graphic_item(vec![plain]), Tick::ZERO, (1200, 300), &Affine::IDENTITY, &mut img);
+            img
+        };
+        assert!(rest.px.iter().zip(&still.px).all(|(a, b)| (a - b).abs() < 1e-5), "the hold looks exactly like the still title");
+        // frame 0: nothing yet
+        assert!(ink_box(&render_at(&item, Tick::ZERO)).is_none());
+        // frame 8: only NO, partly faded and still below its resting place
+        let f8 = render_at(&item, frames60(8));
+        let (a, b) = col(0);
+        let no = ink_in(&f8, a, b, 0.05).expect("NO is entering");
+        let no_rest = ink_in(&rest, a, b, 0.05).unwrap();
+        assert!(no[3] > no_rest[3] + 3, "NO is still below its place: {no:?} vs {no_rest:?}");
+        assert!(max_alpha(&f8, a, b) < 0.95, "and not yet opaque");
+        for i in [1, 2] {
+            let (a, b) = col(i);
+            assert_eq!(max_alpha(&f8, a, b), 0.0, "word {i} has not started");
+        }
+        // frame 24: NO at rest, EXPERIENCE entering, REQUIRED not started
+        let f24 = render_at(&item, frames60(24));
+        let (a, b) = col(0);
+        assert_eq!(ink_in(&f24, a, b, 0.5), ink_in(&rest, a, b, 0.5));
+        let (a, b) = col(1);
+        assert!(max_alpha(&f24, a, b) > 0.05);
+        let (a, b) = col(2);
+        assert_eq!(max_alpha(&f24, a, b), 0.0);
+        // frame 48: the phrase has landed — on one line, never re-centred while it builds
+        let f48 = render_at(&item, frames60(48));
+        assert!(f48.px.iter().zip(&rest.px).all(|(a, b)| (a - b).abs() < 1e-5));
+        // exit: the last 18 frames fade every word together, nothing moves
+        let out = render_at(&item, Tick::from_seconds_f64(5.0) - frames60(9));
+        for i in 0..3 {
+            let (a, b) = col(i);
+            let m = max_alpha(&out, a, b);
+            assert!(m > 0.2 && m < 0.8, "word {i} half faded: {m}");
+            assert_eq!(ink_in(&out, a, b, 0.01).map(|x| x[3]), ink_in(&rest, a, b, 0.01).map(|x| x[3]), "no exit motion");
+        }
+        // deterministic: the same frame renders the same pixels
+        assert_eq!(render_at(&item, frames60(30)).px, render_at(&item, frames60(30)).px);
+    }
+
+    #[test]
+    fn characters_and_lines_are_units_too() {
+        use filmcraft_project::text_anim::frames60;
+        let item = word_rise_item(Some(TextUnit::Char));
+        let spec = item_layer_specs(&item, Tick::ZERO, (1200, 300)).remove(0).1;
+        let LayerContent::Text(t) = &spec.content else { unreachable!() };
+        let l = text_layout(t);
+        assert_eq!(text_units(&l, &t.text, TextUnit::Char).len(), 20, "letters, spaces skipped");
+        // char mode: 14-frame stagger → at frame 15 only "N" and "O" have started
+        let img = render_at(&item, frames60(15));
+        let units = text_units(&l, &t.text, TextUnit::Char);
+        let started: Vec<bool> = units.iter().map(|u| max_alpha(&img, 40.0 + u.rect[0] + 1.0, 40.0 + u.rect[2] - 1.0) > 0.0).collect();
+        assert_eq!(&started[..3], &[true, true, false]);
+        // two lines
+        let lt = TextProps { text: "ONE TWO\nTHREE".into(), ..t.clone() };
+        let ll = text_layout(&lt);
+        let lines = text_units(&ll, &lt.text, TextUnit::Line);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].rect[1] > lines[0].rect[1]);
+        assert_eq!(text_units(&ll, &lt.text, TextUnit::Whole).len(), 1);
+        assert_eq!(text_units(&ll, &lt.text, TextUnit::Word).iter().map(|u| u.line).collect::<Vec<_>>(), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn animated_background_box_stays_put() {
+        use filmcraft_project::text_anim::frames60;
+        let mut item = word_rise_item(None);
+        if let Some(e) = item.effects.iter_mut().find(|e| e.effect == "graphic_text") {
+            set(e, "background", ParamValue::Bool(true));
+            set(e, "background_opacity", ParamValue::Float(100.0));
+        }
+        // before any word arrives the box is drawn, the words are not
+        let img = render_at(&item, Tick::ZERO);
+        let b = ink_box(&img).expect("the box shows");
+        let rest = ink_box(&render_at(&item, frames60(100))).unwrap();
+        assert_eq!(b, rest, "same box as at rest");
     }
 
     #[test]
