@@ -263,3 +263,21 @@ fn transcript_arrow_keys_survive_a_shorter_transcript() {
         d.ok("ui.menu.invoke", json!({"id": format!("textPanel.{op}")}));
     }
 }
+
+/// Every FilmCraft command the Premiere `.kys` import maps onto exists (engine or frontend), and
+/// every panel it maps a Premiere context onto is a shortcut scope.
+#[test]
+fn premiere_kys_table_has_no_dangling_ids() {
+    use filmcraft_engine::premiere_kys;
+    let ui: Vec<String> = filmcraft_ui_egui::menus::external_commands().into_iter().map(|c| c.id).collect();
+    for (p, id) in premiere_kys::COMMANDS {
+        assert!(filmcraft_engine::find_command(id).is_some() || ui.iter().any(|u| u == id), "kys table: {p} → `{id}` is not a command");
+    }
+    for (_, p, id) in premiere_kys::IN_CONTEXT {
+        assert!(filmcraft_engine::find_command(id).is_some() || ui.iter().any(|u| u == id), "kys table: {p} → `{id}` is not a command");
+    }
+    for ctx in ["timeline", "program.monitor", "source.monitor", "project", "effectcontrols", "Graphics", "com.adobe.dva.text", "Properties2", "history"] {
+        let p = premiere_kys::panel_of(ctx).unwrap().unwrap();
+        assert!(filmcraft_engine::shortcuts::PANELS.contains(&p), "{ctx} → {p}");
+    }
+}

@@ -206,7 +206,7 @@ pub struct Chord {
     pub key: &'static str,
 }
 
-fn canon_key(tok: &str) -> Option<&'static str> {
+pub(crate) fn canon_key(tok: &str) -> Option<&'static str> {
     if let Some(k) = KEYS.iter().find(|k| k.eq_ignore_ascii_case(tok)) {
         return Some(k);
     }
@@ -461,6 +461,44 @@ pub struct PresetFile {
     #[serde(default)]
     pub modified: bool,
     pub bindings: Vec<Binding>,
+}
+
+/// Options of [`Shortcuts::import_with`].
+#[derive(Clone, Debug)]
+pub struct ImportOptions {
+    /// Make the imported preset the active set.
+    pub activate: bool,
+    /// The preset name (default: the file's own, or `Premiere – <file name>` for a `.kys`).
+    pub name: Option<String>,
+    /// Only report what the import would do.
+    pub dry_run: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        ImportOptions { activate: true, name: None, dry_run: false }
+    }
+}
+
+/// What an import did.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportReport {
+    pub name: String,
+    /// `filmcraft-keyboard-shortcuts` or `premiere-kys`.
+    pub format: String,
+    /// Shortcuts in the file.
+    pub total: usize,
+    /// Shortcuts carried over.
+    pub mapped: usize,
+    /// Commands the file leaves without a key (they lose FilmCraft's default key).
+    pub unassigned: usize,
+    /// Shortcuts with no FilmCraft counterpart.
+    pub unmapped: Vec<crate::premiere_kys::Unmapped>,
+    /// Bindings in the resulting preset.
+    pub bindings: usize,
+    pub saved: bool,
+    pub activated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -854,25 +892,83 @@ impl Shortcuts {
     /// Import a preset file: saved among the custom presets (when there is a data directory) and,
     /// when `activate`, made the active set.
     pub fn import(&mut self, path: &Path, activate: bool) -> std::result::Result<String, String> {
-        let f = read_file(path)?;
-        let name = if f.name.trim().is_empty() || BUILTIN_PRESETS.contains(&f.name.as_str()) {
-            path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Imported".into())
-        } else {
-            f.name.clone()
+        self.import_with(path, &ImportOptions { activate, ..Default::default() }).map(|r| r.name)
+    }
+
+    /// Import a FilmCraft preset (`.json`) or a Premiere Pro keyboard shortcuts file (`.kys`, see
+    /// [`crate::premiere_kys`]). A `.kys` preset starts from **Premiere Pro Compatible** and takes
+    /// every shortcut of the file that has a FilmCraft counterpart; commands the file leaves
+    /// without a key lose theirs; the rest are reported in [`ImportReport::unmapped`].
+    pub fn import_with(&mut self, path: &Path, o: &ImportOptions) -> std::result::Result<ImportReport, String> {
+        let head = {
+            use std::io::Read;
+            let mut buf = [0u8; 1024];
+            let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)).map_err(|e| format!("{}: {e}", path.display()))?;
+            buf.get(..n).unwrap_or_default().to_vec()
         };
-        let bindings: Vec<Binding> = convert(f.bindings, f.platform).into_iter().filter(|b| self.known(&b.command)).collect();
+        let mut report = ImportReport::default();
+        let (name, bindings) = if crate::premiere_kys::is_kys(&head) {
+            let file = crate::premiere_kys::read(path)?;
+            let conv = crate::premiere_kys::convert(&file, |id| self.known(id));
+            let mut b = self.builtin(PREMIERE_PRESET).unwrap_or_default();
+            // the file decides these commands' keys in these scopes
+            let decided: std::collections::BTreeSet<(String, Option<String>)> =
+                conv.bindings.iter().map(|x| (x.command.clone(), x.panel.clone())).chain(conv.unassigned.iter().cloned()).collect();
+            b.retain(|x| !decided.contains(&(x.command.clone(), x.panel.clone())));
+            for nb in &conv.bindings {
+                let chord = nb.chord();
+                b.retain(|x| !(x.context() == nb.context() && x.chord() == chord));
+            }
+            for nb in conv.bindings.iter() {
+                if !b.contains(nb) {
+                    b.push(nb.clone());
+                }
+            }
+            report.format = "premiere-kys".into();
+            report.total = conv.total;
+            report.mapped = conv.mapped;
+            report.unassigned = conv.unassigned.len();
+            report.unmapped = conv.unmapped;
+            (o.name.clone().unwrap_or_else(|| crate::premiere_kys::preset_name(path)), b)
+        } else {
+            let f = read_file(path)?;
+            let name = if f.name.trim().is_empty() || BUILTIN_PRESETS.contains(&f.name.as_str()) {
+                path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Imported".into())
+            } else {
+                f.name.clone()
+            };
+            let bindings: Vec<Binding> = convert(f.bindings, f.platform).into_iter().filter(|b| self.known(&b.command)).collect();
+            report.format = FILE_FORMAT.into();
+            report.total = bindings.len();
+            report.mapped = bindings.len();
+            (o.name.clone().unwrap_or(name), bindings)
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("a preset needs a name".into());
+        }
+        if BUILTIN_PRESETS.iter().any(|b| b.eq_ignore_ascii_case(&name)) {
+            return Err(format!("`{name}` is a built-in preset; choose another name"));
+        }
+        report.name = name.clone();
+        report.bindings = bindings.len();
+        if o.dry_run {
+            return Ok(report);
+        }
         if let Some(p) = self.preset_path(&name) {
             let file = PresetFile { format: FILE_FORMAT.into(), version: 1, name: name.clone(), platform: None, modified: false, bindings: bindings.clone() };
             write_file(&p, &file)?;
+            report.saved = true;
         }
-        if activate {
+        if o.activate {
             let before = self.snapshot();
             self.bindings = bindings;
             self.preset = name.clone();
             self.modified = false;
             self.changed(before);
+            report.activated = true;
         }
-        Ok(name)
+        Ok(report)
     }
 
     // ---------------------------------------------------------------- queries
@@ -1142,11 +1238,26 @@ pub fn commands() -> Vec<CommandSpec> {
             s.shortcuts.export(Path::new(path)).map_err(err("shortcuts.export"))?;
             Ok(json!({"path": path, "bindings": s.shortcuts.bindings.len()}))
         }),
-        sc!("shortcuts.import", "Import Keyboard Shortcuts", r#"{"path":str,"activate":bool=true}"#, true, |s, p| {
-            let path = str_p(p, "path").ok_or_else(|| bad("shortcuts.import", "need `path`"))?;
-            let name = s.shortcuts.import(Path::new(path), bool_p(p, "activate").unwrap_or(true)).map_err(err("shortcuts.import"))?;
-            Ok(json!({"name": name, "presets": presets_json(s)}))
-        }),
+        sc!(
+            "shortcuts.import",
+            "Import Keyboard Shortcuts",
+            r#"{"path":"<file>.json|<Premiere preset>.kys","activate":bool=true,"name":str?,"dryRun":bool=false}"#,
+            true,
+            |s, p| {
+                let path = str_p(p, "path").ok_or_else(|| bad("shortcuts.import", "need `path`"))?;
+                let o = ImportOptions {
+                    activate: bool_p(p, "activate").unwrap_or(true),
+                    name: str_p(p, "name").map(str::to_string),
+                    dry_run: bool_p(p, "dryRun").unwrap_or(false),
+                };
+                let r = s.shortcuts.import_with(Path::new(path), &o).map_err(err("shortcuts.import"))?;
+                let mut v = serde_json::to_value(&r).unwrap_or_default();
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("presets".into(), presets_json(s));
+                }
+                Ok(v)
+            }
+        ),
         sc!("shortcuts.audit", "Shortcut Audit", "{}", false, |s, _| {
             let a = s.shortcuts.audit();
             Ok(json!({"count": a.len(), "assigned": a}))

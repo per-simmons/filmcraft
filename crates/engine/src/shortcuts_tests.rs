@@ -231,3 +231,224 @@ fn list_searches_labels_and_keys() {
     let v = s.execute("shortcuts.list", json!({"panel": "History", "assigned": true})).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 2, "{v}");
 }
+
+// ------------------------------------------------------------------ Premiere .kys files
+
+/// One `.kys` item: `key` is a Premiere virtual key code (0 = no key), `mods` = "cmd opt shift ctrl".
+fn kys_item(i: usize, cmd: &str, key: u64, mods: &str) -> String {
+    let m = |n: &str| mods.split_whitespace().any(|x| x == n);
+    if key == 0 {
+        return format!("<item.{i} Version=\"1\"><commandname>{cmd}</commandname></item.{i}>");
+    }
+    format!(
+        "<item.{i} Version=\"1\"><virtualkey>{key}</virtualkey><modifier.command>{}</modifier.command><modifier.opt>{}</modifier.opt>\
+         <modifier.shift>{}</modifier.shift><modifier.ctrl>{}</modifier.ctrl><commandname>{cmd}</commandname></item.{i}>",
+        m("cmd"),
+        m("opt"),
+        m("shift"),
+        m("ctrl")
+    )
+}
+
+fn kys(contexts: &[(&str, Vec<(&str, u64, &str)>)]) -> String {
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PremiereData Version=\"3\"><shortcuts Version=\"5\"><platform>macintosh</platform>");
+    for (ctx, items) in contexts {
+        s.push_str(&format!("<context.{ctx} Version=\"1\"><itemcount>{}</itemcount>", items.len()));
+        for (i, (c, k, m)) in items.iter().enumerate() {
+            s.push_str(&kys_item(i, c, *k, m));
+        }
+        s.push_str(&format!("</context.{ctx}>"));
+    }
+    s.push_str("</shortcuts></PremiereData>\n");
+    s
+}
+
+/// A typed character's key code (`0x8000_0000 | ASCII`).
+const fn ch(c: u8) -> u64 {
+    0x8000_0000 | c as u64
+}
+
+/// A small custom Premiere preset, written for these tests.
+fn sample_kys() -> String {
+    kys(&[
+        (
+            "global",
+            vec![
+                ("cmd.sequence.razorateditline", ch(b'K'), "cmd"),
+                ("cmd.edit.rippledelete", ch(b'T'), ""),
+                ("cmd.tlnav.select.clip.at.playhead", ch(b'D'), ""),
+                ("cmd.sequence.rippletrimpreviousedittoplayhead", ch(b'Q'), ""),
+                ("cmd.file.new.adjustmentlayer", ch(b'Y'), "cmd"),
+                ("cmd.clip.settoframesize", ch(b'S'), "opt"),
+                ("cmd.edit.duplicate", ch(b'/'), "cmd shift"),
+                ("cmd.transport.toggleplay", 1, ""),
+                ("cmd.tlnav.prev.edit", 44, ""),
+                ("cmd.transport.step.back.five", 42, "shift"),
+                ("cmd.sequence.decreaseclipvolume", ch(b'['), ""),
+                ("cmd.toggle.maximize.frame", ch(b'`'), ""),
+                ("cmd.help.contents", 7, ""),
+                ("cmd.edit.clear", 35, ""),
+                ("uif.window.Timelines", ch(b'3'), "shift"),
+                ("cmd.tlnav.select.nearest.edit.as.ripple.out", ch(b'T'), "shift"),
+                // no key: Snap loses its S
+                ("cmd.sequence.snap", 0, ""),
+                // Premiere-only
+                ("cmd.titler.menu.templates", ch(b'J'), "cmd"),
+                ("cmd.file.capture", 11, ""),
+                ("cmd.mystery", 999, "cmd"),
+            ],
+        ),
+        ("timeline", vec![("cmd.timeline.paste.to.same.track", ch(b'V'), "cmd"), ("cmd.edit.clear", 2, "")]),
+        ("project", vec![("cmd.edit.clear", 2, ""), ("cmd.file.newbinfromselection", ch(b'B'), "shift")]),
+        ("prproduction", vec![("cmd.prproductionfolder.makeacopy", ch(b'/'), "cmd shift")]),
+    ])
+}
+
+#[test]
+fn kys_keys_decode_from_premiere_codes() {
+    use crate::premiere_kys::decode_key;
+    assert_eq!(decode_key(2147483723), Some("K"), "0x8000_0000 | 'K'");
+    assert_eq!(decode_key(ch(b'k')), Some("K"));
+    assert_eq!(decode_key(ch(b'/')), Some("/"));
+    assert_eq!(decode_key(ch(b'`')), Some("`"));
+    assert_eq!(decode_key(ch(b'\\')), Some("\\"));
+    assert_eq!(decode_key(1), Some("Space"));
+    assert_eq!(decode_key(2), Some("Backspace"));
+    assert_eq!(decode_key(4), Some("Enter"));
+    assert_eq!(decode_key(7), Some("F1"));
+    assert_eq!(decode_key(18), Some("F12"));
+    assert_eq!(decode_key(35), Some("Delete"));
+    assert_eq!((decode_key(42), decode_key(43), decode_key(44), decode_key(45)), (Some("Left"), Some("Right"), Some("Up"), Some("Down")));
+    for bad in [0, 999, ch(b' '), ch(0x7f), 0x8000_0000 | 0x1F600, u64::MAX, 0xFFFF_FFFF] {
+        assert_eq!(decode_key(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn kys_import_maps_commands_panels_and_keys() {
+    let dir = temp_dir("kys");
+    let path = dir.join("[Custom 2].kys");
+    std::fs::write(&path, sample_kys()).unwrap();
+    let mut s = Session::default();
+    with_ui_commands(&mut s);
+    s.shortcuts.register_external(vec![
+        CommandInfo::new("playback.toggle", "Play/Stop", &[], Some("Space")),
+        CommandInfo::new("tool.type", "Type Tool", &[], Some("T")),
+        CommandInfo::new("window.panel.Timeline", "Timeline", &["Window"], Some("Shift+3")),
+        CommandInfo::new("window.maximizeFrameUnderCursor", "Maximize Frame", &[], None),
+        CommandInfo::new("help.filmcraftHelp", "FilmCraft Help", &[], None),
+    ]);
+    s.shortcuts.set_dir(&dir);
+    // a dry run reports without changing anything
+    let before = s.shortcuts.preset.clone();
+    let r = s.execute("shortcuts.import", json!({"path": path.to_string_lossy(), "dryRun": true})).unwrap();
+    assert_eq!(r["name"], json!("Premiere – Custom 2"));
+    assert_eq!((r["saved"].clone(), r["activated"].clone()), (json!(false), json!(false)));
+    assert_eq!(s.shortcuts.preset, before);
+    // the real import
+    let r = s.execute("shortcuts.import", json!({"path": path.to_string_lossy(), "name": "Pat – Premiere Custom 2"})).unwrap();
+    assert_eq!(r["format"], json!("premiere-kys"));
+    assert_eq!(r["total"], json!(24), "{r}");
+    assert_eq!(r["mapped"], json!(20), "{r}");
+    let unmapped: Vec<(String, String, String)> = r["unmapped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| (u["command"].as_str().unwrap().to_string(), u["keys"].as_str().unwrap().to_string(), u["reason"].as_str().unwrap().to_string()))
+        .collect();
+    assert!(unmapped.contains(&("cmd.titler.menu.templates".into(), "Cmd+J".into(), "no FilmCraft command".into())), "{unmapped:?}");
+    assert!(unmapped.contains(&("cmd.file.capture".into(), "F5".into(), "no FilmCraft command".into())));
+    assert!(unmapped.contains(&("cmd.mystery".into(), "key code 999".into(), "no FilmCraft command".into())));
+    assert!(unmapped.iter().any(|u| u.0 == "cmd.prproductionfolder.makeacopy" && u.2 == "panel not in FilmCraft"));
+    assert_eq!(r["activated"], json!(true));
+    assert_eq!(s.shortcuts.preset, "Pat – Premiere Custom 2");
+    assert!(!s.shortcuts.modified);
+    assert_eq!(r["presets"]["custom"], json!(["Pat – Premiere Custom 2"]));
+    let sc = &s.shortcuts;
+    let res = |k: &str, p: Option<&str>| sc.resolve(&Chord::parse(k).unwrap(), p, Platform::Mac).map(|b| b.command.clone());
+    assert_eq!(res("T", None).as_deref(), Some("edit.rippleDelete"), "Pat's T");
+    assert!(sc.for_command("tool.type").is_empty(), "T was taken from the Type tool");
+    assert_eq!(res("Cmd+K", None).as_deref(), Some("sequence.addEdit"));
+    assert_eq!(res("D", None).as_deref(), Some("timeline.selectClipAtPlayhead"));
+    assert_eq!(res("Q", None).as_deref(), Some("trim.ripplePrevious"));
+    assert_eq!(res("Cmd+Y", None).as_deref(), Some("file.newAdjustmentLayer"));
+    assert_eq!(res("Alt+S", None).as_deref(), Some("clip.fitToFrame"));
+    assert_eq!(res("Cmd+Shift+/", None).as_deref(), Some("edit.duplicate"));
+    assert_eq!(res("Space", None).as_deref(), Some("playback.toggle"));
+    assert_eq!(res("Up", None).as_deref(), Some("playhead.prevEdit"));
+    assert_eq!(res("Shift+Left", None).as_deref(), Some("playhead.stepBack5"));
+    assert_eq!(res("[", None).as_deref(), Some("clip.volumeDown"));
+    assert_eq!(res("`", None).as_deref(), Some("window.maximizeFrameUnderCursor"));
+    assert_eq!(res("F1", None).as_deref(), Some("help.filmcraftHelp"));
+    assert_eq!(res("Shift+3", None).as_deref(), Some("window.panel.Timeline"));
+    assert_eq!(res("Shift+T", None).as_deref(), Some("trim.selectNearestRippleOut"));
+    assert!(sc.for_command("sequence.snap").is_empty(), "the file leaves Snap without a key");
+    // panel contexts
+    assert_eq!(res("Cmd+V", Some("Timeline")).as_deref(), Some("edit.paste"));
+    assert_eq!(res("Backspace", Some("Timeline")).as_deref(), Some("edit.clear"));
+    assert_eq!(res("Backspace", Some("Project")).as_deref(), Some("project.delete"), "Clear in the Project panel deletes items");
+    assert_eq!(res("Shift+B", Some("Project")).as_deref(), Some("file.newBinFromSelection"));
+    // commands the file doesn't mention keep their Premiere Pro Compatible keys
+    assert_eq!(sc.primary("edit.undo").as_deref(), Some("Cmd+Z"));
+    assert_eq!(sc.primary("markers.markIn").as_deref(), Some("I"));
+    assert!(sc.conflicts(Platform::Mac).is_empty(), "{:?}", sc.conflicts(Platform::Mac));
+    // the preset is a custom preset like any other: switch away and back
+    s.execute("shortcuts.loadPreset", json!({"name": "FilmCraft Default"})).unwrap();
+    assert_eq!(s.shortcuts.primary("tool.type").as_deref(), Some("T"));
+    s.execute("shortcuts.loadPreset", json!({"name": "Pat – Premiere Custom 2"})).unwrap();
+    assert_eq!(s.shortcuts.resolve(&Chord::parse("T").unwrap(), None, Platform::Mac).map(|b| b.command.as_str()), Some("edit.rippleDelete"));
+    // default name, and built-in names are refused
+    let r = s.execute("shortcuts.import", json!({"path": path.to_string_lossy(), "activate": false})).unwrap();
+    assert_eq!((r["name"].clone(), r["activated"].clone()), (json!("Premiere – Custom 2"), json!(false)));
+    assert!(s.execute("shortcuts.import", json!({"path": path.to_string_lossy(), "name": "Premiere Pro Compatible"})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kys_windows_files_use_ctrl_as_the_primary_modifier() {
+    let text = kys(&[("global", vec![("cmd.sequence.razorateditline", ch(b'K'), "ctrl")])]).replace("macintosh", "windows");
+    let f = crate::premiere_kys::parse(&text).unwrap();
+    assert_eq!(f.platform, Platform::Windows);
+    assert_eq!(f.items[0].chord.as_ref().map(Chord::canonical).as_deref(), Some("Cmd+K"));
+}
+
+/// Hostile files: errors, never a panic (AGENTS.md §0.8).
+#[test]
+fn kys_hostile_files_fail_cleanly() {
+    let dir = temp_dir("kys-hostile");
+    let mut s = Session::default();
+    s.shortcuts.set_dir(&dir);
+    let cases: Vec<Vec<u8>> = vec![
+        b"<PremiereData".to_vec(),
+        b"<PremiereData Version=\"3\"></PremiereData>".to_vec(),
+        b"<PremiereData><shortcuts><context.global><item.0><virtualkey>-5</virtualkey><commandname>cmd.edit.undo</commandname></item.0></context.global></shortcuts></PremiereData>".to_vec(),
+        b"<PremiereData><shortcuts><context.global><item.0><virtualkey>99999999999999999999999</virtualkey><commandname></commandname></item.0></context.global></shortcuts></PremiereData>".to_vec(),
+        b"<!DOCTYPE x [<!ENTITY a \"aaaa\">]><PremiereData>&a;</PremiereData>".to_vec(),
+        vec![0xff, 0xfe, b'<', 0, b'P', 0],
+    ];
+    for (i, bytes) in cases.iter().enumerate() {
+        let p = dir.join(format!("bad{i}.kys"));
+        std::fs::write(&p, bytes).unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.execute("shortcuts.import", json!({"path": p.to_string_lossy()}))));
+        assert!(r.is_ok(), "case {i} panicked");
+    }
+    assert!(s.execute("shortcuts.import", json!({"path": dir.join("missing.kys").to_string_lossy()})).is_err());
+    // mutation fuzz: truncations and byte flips of a real-shaped file
+    let good = sample_kys().into_bytes();
+    let mut seed = 0x2545_f491_u64;
+    for n in 0..300 {
+        let mut b = good.clone();
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        if n % 3 == 0 {
+            b.truncate((seed as usize) % b.len());
+        } else {
+            let at = (seed as usize) % b.len();
+            b[at] ^= (seed >> 32) as u8 | 1;
+        }
+        let r = std::panic::catch_unwind(|| crate::premiere_kys::parse(&String::from_utf8_lossy(&b)).map(|f| crate::premiere_kys::convert(&f, |_| true)));
+        assert!(r.is_ok(), "mutation {n} panicked");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

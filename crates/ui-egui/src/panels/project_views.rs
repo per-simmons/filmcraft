@@ -554,6 +554,7 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         let Some(b) = app.session.project.root.find_bin(bid).cloned() else { continue };
         let open = app.ui.expanded_bins.contains(&b.id.0) || !filter.is_empty();
         let (r, resp) = ui.allocate_exact_size(vec2(lc.width, lc.row_h), Sense::click());
+        reveal_if_asked(app, ui, r, b.id.0);
         let selected = app.ui.project_panel.selected_bin == Some(b.id.0);
         if selected {
             ui.painter().rect_filled(r, 0.0, t.row_selected);
@@ -601,6 +602,7 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         }
         let Some(it) = app.session.project.item(id).cloned() else { continue };
         let (r, resp) = ui.allocate_exact_size(vec2(lc.width, lc.row_h), Sense::click_and_drag());
+        reveal_if_asked(app, ui, r, id.0);
         let selected = app.session.state.project_selection.contains(&id);
         if selected {
             ui.painter().rect_filled(r, 0.0, t.row_selected);
@@ -655,6 +657,14 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
     }
 }
 
+/// Scroll a new copy (Duplicate, Paste) into view once it is laid out.
+fn reveal_if_asked(app: &mut FilmcraftApp, ui: &egui::Ui, r: Rect, id: u64) {
+    if app.ui.project_panel.reveal == Some(id) {
+        ui.scroll_to_rect(r, None);
+        app.ui.project_panel.reveal = None;
+    }
+}
+
 /// An item's thumbnail at `t` (None: the poster frame or a third in) fitted into `r`.
 fn thumb(app: &mut FilmcraftApp, ui: &egui::Ui, r: Rect, it: &filmcraft_project::ProjectItem, at: Option<Tick>) {
     ui.painter().rect_filled(r, 2.0, Color32::from_rgb(12, 12, 12));
@@ -694,6 +704,7 @@ fn card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, id: ItemId, pre: &st
     let t = app.tokens;
     let it = app.session.project.item(id).cloned()?;
     let resp = ui.interact(r.expand(2.0), egui::Id::new((pre, "card", id.0)), sense);
+    reveal_if_asked(app, ui, r, id.0);
     let th = Rect::from_min_size(r.min, vec2(r.width(), r.width() * 9.0 / 16.0));
     let selected = app.session.state.project_selection.contains(&id);
     let card_bg = Rect::from_min_max(th.min - vec2(6.0, 6.0), pos2(th.max.x + 6.0, r.max.y + 2.0));
@@ -782,6 +793,7 @@ fn bin_card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, b: &Bin, v: &Vie
     let t = app.tokens;
     let th = Rect::from_min_size(r.min, vec2(r.width(), r.width() * 9.0 / 16.0));
     let resp = ui.interact(r.expand(2.0), egui::Id::new((&v.prefix, "bincard", b.id.0)), Sense::click());
+    reveal_if_asked(app, ui, r, b.id.0);
     let selected = app.ui.project_panel.selected_bin == Some(b.id.0);
     let bg = Rect::from_min_max(th.min - vec2(6.0, 6.0), pos2(th.max.x + 6.0, r.max.y + 2.0));
     ui.painter().rect_filled(bg, 4.0, if selected { t.tl_header_bg } else { t.panel_bg });

@@ -167,6 +167,57 @@ pub(crate) fn open_dialog_for(app: &mut FilmcraftApp, id: &str) -> bool {
     true
 }
 
+/// Edit-menu commands that act on the focused panel, as in Premiere: with the Project panel
+/// focused, Copy / Cut / Paste work on its items and bins (`project.copy` / `project.cut` /
+/// `project.paste`) and Select All / Deselect All on its items; elsewhere they are the timeline's.
+/// Used for keyboard shortcuts and menu clicks (agents name the command they mean).
+pub fn focus_route(app: &FilmcraftApp, id: &str, params: Value) -> (String, Value) {
+    if app.ui.focused != PanelKind::Project || params.as_object().is_some_and(|m| !m.is_empty()) {
+        return (id.to_string(), params);
+    }
+    let pp = &app.ui.project_panel;
+    let mut items: Vec<u64> = app.session.state.project_selection.iter().map(|i| i.0).collect();
+    if let Some(b) = pp.selected_bin
+        && !items.contains(&b)
+    {
+        items.push(b);
+    }
+    match id {
+        "edit.copy" | "edit.cut" => (id.replacen("edit.", "project.", 1), if items.is_empty() { json!({}) } else { json!({"items": items}) }),
+        // into the selected bin; with items selected, their bin; else the bin the panel shows
+        "edit.paste" => {
+            let bin = pp.selected_bin.or_else(|| app.session.state.project_selection.is_empty().then(|| app.import_bin().0));
+            ("project.paste".into(), bin.map(|b| json!({"bin": b})).unwrap_or_else(|| json!({})))
+        }
+        "edit.selectAll" | "edit.deselectAll" => (id.replacen("edit.", "project.", 1), params),
+        _ => (id.to_string(), params),
+    }
+}
+
+/// After Duplicate / Paste in the Project panel: open the bins holding the new copies and scroll
+/// the last one into view (it is already selected).
+fn reveal_new(app: &mut FilmcraftApp, result: &Value) {
+    let last = result["bins"].as_array().and_then(|b| b.last()).or_else(|| result["items"].as_array().and_then(|i| i.last())).and_then(Value::as_u64);
+    let Some(id) = last else { return };
+    let p = &app.session.project;
+    let mut bin = p.bin_of(filmcraft_project::ItemId(id)).or_else(|| p.parent_bin(filmcraft_project::BinId(id)));
+    let mut guard = 0;
+    while let Some(b) = bin.filter(|b| *b != p.root.id) {
+        if !app.ui.expanded_bins.contains(&b.0) {
+            app.ui.expanded_bins.push(b.0);
+        }
+        bin = p.parent_bin(b);
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+    }
+    if result["bins"].as_array().is_some_and(|b| !b.is_empty()) {
+        app.ui.project_panel.selected_bin = None;
+    }
+    app.ui.project_panel.reveal = Some(id);
+}
+
 pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish" | "app.language.portuguese") {
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
@@ -428,6 +479,11 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
     if r.is_ok() && matches!(id, "edit.copy" | "edit.cut") {
         put_clip_names_on_system_clipboard(app, ctx);
     }
+    if let Ok(v) = &r
+        && matches!(id, "edit.duplicate" | "project.paste")
+    {
+        reveal_new(app, v);
+    }
     r
 }
 
@@ -473,6 +529,11 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
         if it.id.starts_with("view.") {
             it.checked = crate::panels::monitor_view::checked(app, &it.id).or(crate::panels::menu_dialogs::checked(app, &it.id));
             it.enabled &= crate::panels::monitor_view::enabled(app, &it.id);
+        }
+        // Edit ▸ Copy / Cut / Paste follow the focused panel (see `focus_route`)
+        if app.ui.focused == PanelKind::Project && matches!(it.id.as_str(), "edit.copy" | "edit.cut" | "edit.paste") {
+            let (routed, _) = focus_route(app, &it.id, json!({}));
+            it.enabled = app.session.is_enabled(&routed) || (routed != "project.paste" && app.ui.project_panel.selected_bin.is_some());
         }
     }
     crate::panels::workspaces::menu(app, &mut v);
@@ -641,7 +702,10 @@ pub fn menu_bar(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     if let Some(id) = clicked
         && !open_dialog_for(app, &id)
     {
-        let _ = invoke(app, &ctx, &id, json!({}));
+        let (id, params) = focus_route(app, &id, json!({}));
+        if let Err(e) = invoke(app, &ctx, &id, params) {
+            app.ui.status = e;
+        }
     }
 }
 

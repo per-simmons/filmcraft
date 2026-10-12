@@ -32,8 +32,10 @@ pub mod mixer;
 pub mod multicam;
 pub mod panels;
 pub mod perf;
+pub mod premiere_kys;
 pub mod presets;
 pub mod previews;
+pub mod project_clipboard;
 pub mod project_manager;
 pub mod project_panel;
 pub mod project_tools;
@@ -254,6 +256,12 @@ pub struct EditorState {
     /// Timeline clipboard (serialized track items with their relative track index).
     #[serde(skip)]
     pub clipboard: Vec<(TrackKind, usize, filmcraft_project::TrackItem)>,
+    /// Project panel clipboard: item and bin ids copied or cut with `project.copy` / `project.cut`.
+    #[serde(skip)]
+    pub project_clipboard: Vec<u64>,
+    /// The clipboard was cut: the next `project.paste` moves the items.
+    #[serde(skip)]
+    pub project_clipboard_cut: bool,
     pub default_video_transition: String,
     pub default_audio_transition: String,
     /// Selected edit points (trim mode).
@@ -1099,6 +1107,8 @@ mod panels_tests;
 mod presets_tests;
 #[cfg(test)]
 mod previews_tests;
+#[cfg(test)]
+mod project_clipboard_tests;
 #[cfg(test)]
 mod project_manager_tests;
 #[cfg(test)]

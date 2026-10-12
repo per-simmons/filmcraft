@@ -1140,18 +1140,17 @@ impl FilmcraftApp {
                 }
             }
         });
-        for mut id in fire {
-            // Select All / Deselect All act on the Project panel's items when it has focus (#168).
-            if self.ui.focused == PanelKind::Project && matches!(id.as_str(), "edit.selectAll" | "edit.deselectAll") {
-                id = id.replacen("edit.", "project.", 1);
-            }
+        for id in fire {
+            // Copy / Cut / Paste / Select All act on the Project panel's items when it has focus
+            // (#168), like Premiere; elsewhere on the timeline.
+            let (id, routed) = menus::focus_route(self, &id, json!({}));
             // Mark In/Out in the Source monitor when it has focus.
             let params = if self.ui.focused == PanelKind::Source
                 && (matches!(id.as_str(), "markers.markIn" | "markers.markOut") || id.starts_with("markers.markSplit") || id.starts_with("markers.goToSplit"))
             {
                 json!({"target": "source"})
             } else {
-                json!({})
+                routed
             };
             if menus::open_dialog_for(self, &id) {
                 continue;
@@ -1310,7 +1309,9 @@ impl FilmcraftApp {
                 if menus::open_dialog_for(self, &id) {
                     continue;
                 }
-                if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
+                // native menu items and their key equivalents follow the focused panel too
+                let (id, params) = menus::focus_route(self, &id, json!({}));
+                if let Err(e) = menus::invoke(self, &ctx, &id, params) {
                     self.ui.status = e;
                 }
             }
