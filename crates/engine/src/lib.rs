@@ -43,6 +43,7 @@ pub mod proxies;
 pub mod push_in;
 pub mod relink;
 pub mod remix;
+pub mod repeats;
 pub mod scene_detect;
 pub mod scopes;
 pub mod screen_activity;
@@ -1121,6 +1122,8 @@ mod push_in_tests;
 mod relink_tests;
 #[cfg(test)]
 mod remix_tests;
+#[cfg(test)]
+mod repeats_tests;
 #[cfg(test)]
 mod ripple_delete_tests;
 #[cfg(test)]
