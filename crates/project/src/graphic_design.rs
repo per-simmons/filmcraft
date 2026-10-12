@@ -41,11 +41,14 @@ pub struct LayerExtra {
     /// Responsive Design – Position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin: Option<Pin>,
+    /// Staggered word / character / line animation of a text layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anim: Option<crate::text_anim::TextAnim>,
 }
 
 impl LayerExtra {
     pub fn is_empty(&self) -> bool {
-        self.uid == 0 && self.runs.is_empty() && self.pin.is_none()
+        self.uid == 0 && self.runs.is_empty() && self.pin.is_none() && self.anim.is_none()
     }
 }
 

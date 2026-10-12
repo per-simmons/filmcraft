@@ -697,6 +697,52 @@ pub fn builtin_templates() -> Vec<GraphicsTemplate> {
         t.graphic.roll = Roll { mode: RollMode::CrawlLeft, start_off_screen: true, end_off_screen: true, ..Default::default() };
         v.push(t);
     }
+    // Emphasis titles: one white, all-caps serif line low in the frame, no box, no rotation.
+    // Set in the bundled Noto Serif (OFL) so they look the same everywhere; pick another serif
+    // with the Font control. "Word Rise" brings the words in one after another.
+    for (id, name, description, anim) in [
+        (
+            "emphasis-serif-caps",
+            "Emphasis – Serif Caps",
+            "A large white all-caps serif line, centred low in the frame with no box; fades out over its last 18 frames (60 fps).",
+            crate::text_anim::TextAnim {
+                unit: crate::text_anim::TextUnit::Whole,
+                intro: None,
+                outro: crate::text_anim::preset("word-rise").and_then(|a| a.outro),
+                seed: 0,
+            },
+        ),
+        (
+            "emphasis-serif-word-rise",
+            "Emphasis – Serif Word Rise",
+            "The serif caps title with its words rising 36 px and fading in one after another (all landed after 48 frames at 60 fps); fades out over its last 18 frames.",
+            crate::text_anim::preset("word-rise").unwrap_or_default(),
+        ),
+    ] {
+        let mut e = text(1, "Emphasis", "NO EXPERIENCE REQUIRED", (960.0, 864.0), 111.0, "Bold");
+        set(&mut e, "font", ParamValue::Text("Noto Serif".into()));
+        set(&mut e, "align", ParamValue::Choice(1));
+        set(&mut e, "tracking", ParamValue::Float(15.0));
+        set(&mut e, "fill_color", rgb(0xffffff));
+        if let Some(x) = e.layer.as_mut() {
+            x.anim = Some(anim);
+        }
+        v.push(builtin(
+            id,
+            name,
+            "Titles",
+            description,
+            5,
+            vec![e],
+            vec![
+                ctl("text", "Text", 1, "text"),
+                slider("size", "Size", 1, "size", 30.0, 300.0),
+                ctl("font", "Font", 1, "font"),
+                ctl("position", "Position", 1, "position"),
+                ctl("color", "Color", 1, "fill_color"),
+            ],
+        ));
+    }
     v
 }
 
