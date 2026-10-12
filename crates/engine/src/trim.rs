@@ -5,9 +5,12 @@
 //! `timeline.trim` / `timeline.roll` commands so linked partners and sync locks behave the same as
 //! with the mouse.
 //!
-//! **Trim Monitor** ([`monitor_info`]): while edit points are selected the Program monitor shows the
-//! outgoing clip's last frame and the incoming clip's first frame, with the Out/In shift counters
-//! ([`TrimShift`]) that count how far each side moved since the edit point was selected.
+//! **Trim Monitor** ([`monitor_info`]): after Trim Edit (`trim.edit`, or double-clicking an edit
+//! point) the Program monitor shows the outgoing clip's last frame and the incoming clip's first
+//! frame, with the Out/In shift counters ([`TrimShift`]) that count how far each side moved since
+//! the edit point was selected. Selecting edit points (click, Cmd-click, `trim.selectNearest*`)
+//! only highlights them on the timeline and never opens it, as in Premiere; keyboard trimming of
+//! the selection works either way.
 //!
 //! **Dynamic trimming** ([`TrimPlayback`]): in trim mode J/L "play" the edit point — it moves at the
 //! shuttle speed (L forward, J backward, pressing again doubles the speed up to 8×, Shift = slow)
@@ -83,6 +86,33 @@ pub fn roll_pair(seq: &Sequence, ep: &EditPoint) -> Option<(ClipId, ClipId)> {
     }
 }
 
+/// True when the Program monitor shows the Trim Monitor: opened by Trim Edit and edit points are
+/// still selected.
+pub fn monitor_open(s: &Session) -> bool {
+    s.state.trim_monitor && !s.state.edit_points.is_empty()
+}
+
+/// `trim.edit` (Sequence ▸ Trim Edit, double-click an edit point): open the Trim Monitor on the
+/// selected edit points, selecting the nearest roll edit first when none are selected.
+pub fn open_monitor(s: &mut Session) -> Result<Value> {
+    if s.state.edit_points.is_empty() {
+        select_nearest(s, &json!({"kind": "roll"}))?;
+    }
+    if s.state.edit_points.is_empty() {
+        return Err(EngineError::Other("no edit point to trim".into()));
+    }
+    s.state.trim_monitor = true;
+    Ok(json!({"editPoints": s.state.edit_points}))
+}
+
+/// A new edit point selection that doesn't continue an existing one (nothing selected before)
+/// starts with the Trim Monitor closed; while it is open, re-selecting keeps it open.
+fn start_selection(s: &mut Session) {
+    if s.state.edit_points.is_empty() {
+        s.state.trim_monitor = false;
+    }
+}
+
 fn kind_p(p: &Value) -> Option<TrimKind> {
     serde_json::from_value(p.get("kind")?.clone()).ok()
 }
@@ -94,6 +124,7 @@ pub fn select(s: &mut Session, p: &Value) -> Result<Value> {
     let kind = kind_p(p).unwrap_or(TrimKind::Trim);
     s.active_sequence().and_then(|q| q.find_item(clip)).ok_or_else(|| EngineError::Other(format!("no clip {}", clip.0)))?;
     let ep = EditPoint { clip, out, kind };
+    start_selection(s);
     if p.get("add").and_then(Value::as_bool).unwrap_or(false) {
         if let Some(i) = s.state.edit_points.iter().position(|e| e.clip == clip && e.out == out) {
             s.state.edit_points.remove(i);
@@ -153,6 +184,7 @@ pub fn select_nearest(s: &mut Session, p: &Value) -> Result<Value> {
             points.push(ep);
         }
     }
+    start_selection(s);
     s.state.edit_points = points;
     s.state.selection.clear();
     reset_shift(s);
@@ -319,7 +351,8 @@ pub fn monitor_info(s: &Session) -> Value {
     let (out_c, in_c) = sides(seq, ep);
     let tp = &s.trim_play;
     json!({
-        "active": true,
+        // the Program monitor shows the Trim Monitor (Trim Edit); selected edit points alone don't
+        "active": monitor_open(s),
         "kind": ep.kind,
         "edge": if ep.out { "out" } else { "in" },
         "editTime": edit_time(seq, ep).map(|t| t.0),

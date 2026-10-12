@@ -270,6 +270,11 @@ pub struct EditorState {
     /// Trim Monitor Out/In shift counters for the selected edit point.
     #[serde(default)]
     pub trim_shift: trim::TrimShift,
+    /// The Program monitor shows the Trim Monitor. Only Trim Edit (`trim.edit`, also on
+    /// double-clicking an edit point) opens it; selecting edit points just highlights them on the
+    /// timeline, as in Premiere. Read it through [`trim::monitor_open`] (no edit points = closed).
+    #[serde(default)]
+    pub trim_monitor: bool,
     /// Selected captions (caption tracks / Captions panel).
     #[serde(default)]
     pub caption_selection: Vec<ClipId>,

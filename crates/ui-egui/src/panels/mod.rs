@@ -74,7 +74,7 @@ pub fn eta_suffix(job: &serde_json::Value) -> String {
 
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
     match p {
-        PanelKind::Program if !app.session.state.edit_points.is_empty() => trim_monitor::show(app, ui, rect),
+        PanelKind::Program if filmcraft_engine::trim::monitor_open(&app.session) => trim_monitor::show(app, ui, rect),
         PanelKind::Program => monitor::show(app, ui, rect, monitor::Which::Program),
         PanelKind::Source => monitor::show(app, ui, rect, monitor::Which::Source),
         PanelKind::Timeline => timeline::show(app, ui, rect),

@@ -210,3 +210,50 @@ fn trim_monitor_sides_and_shift_counters() {
     let seq = s.execute("sequence.inspect", json!({})).unwrap();
     assert!(!seq["video"][0]["transitions"].as_array().unwrap().is_empty());
 }
+
+/// Selecting edit points (Select Nearest Edit Point as Ripple In/Out, clicking an edge) only
+/// highlights them, as in Premiere: the Program monitor switches to the Trim Monitor on Trim Edit
+/// (`trim.edit`) alone. Every selection used to open it, and Pat had to close it after each Shift+Y.
+#[test]
+fn selecting_an_edit_point_does_not_open_the_trim_monitor() {
+    let mut s = demo();
+    let c = v1(&s);
+    s.set_playhead(c[0].2 - s.sequence_rate().tick_of(2));
+    for cmd in ["trim.selectNearestRippleIn", "trim.selectNearestRippleOut", "trim.selectNearestRoll"] {
+        s.execute(cmd, json!({})).unwrap();
+        assert!(!s.state.edit_points.is_empty(), "{cmd} selected an edit point");
+        let info = s.execute("trim.monitor", json!({})).unwrap();
+        assert_eq!(info["active"], json!(false), "{cmd} must not open the Trim Monitor: {info}");
+        assert!(!crate::trim::monitor_open(&s));
+    }
+    s.execute("trim.selectEditPoint", json!({"clip": c[0].0, "edge": "out", "kind": "ripple"})).unwrap();
+    assert!(!crate::trim::monitor_open(&s), "clicking an edge doesn't open it");
+    // keyboard trimming of the selected edit works without the monitor
+    s.execute("trim.forward", json!({})).unwrap();
+    assert_eq!(v1(&s)[0].2, c[0].2 + s.sequence_rate().tick_of(1));
+    s.execute("trim.extendToPlayhead", json!({})).unwrap();
+    assert_eq!(v1(&s)[0].2, s.playhead());
+    assert!(!crate::trim::monitor_open(&s));
+    // Trim Edit opens it on the selection
+    s.execute("trim.edit", json!({})).unwrap();
+    assert_eq!(s.execute("trim.monitor", json!({})).unwrap()["active"], json!(true));
+    // re-selecting while it is open keeps it open; clearing the selection closes it
+    s.execute("trim.selectNearestRippleIn", json!({})).unwrap();
+    assert!(crate::trim::monitor_open(&s), "selecting inside the Trim Monitor keeps it");
+    s.execute("trim.clear", json!({})).unwrap();
+    assert!(!crate::trim::monitor_open(&s));
+    s.execute("trim.selectNearestRippleIn", json!({})).unwrap();
+    assert!(!crate::trim::monitor_open(&s), "a new selection after closing starts closed");
+    // a selection cleared by any other route (here: selecting a clip) doesn't leave it armed
+    s.execute("trim.edit", json!({})).unwrap();
+    assert!(crate::trim::monitor_open(&s));
+    s.execute("timeline.select", json!({"clips": [c[1].0]})).unwrap();
+    assert!(!crate::trim::monitor_open(&s));
+    s.state.selection.clear();
+    s.execute("trim.selectNearestRippleOut", json!({})).unwrap();
+    assert!(!crate::trim::monitor_open(&s));
+    // Trim Edit with nothing selected picks the nearest roll edit and opens the monitor
+    s.execute("trim.clear", json!({})).unwrap();
+    s.execute("trim.edit", json!({})).unwrap();
+    assert!(!s.state.edit_points.is_empty() && crate::trim::monitor_open(&s));
+}

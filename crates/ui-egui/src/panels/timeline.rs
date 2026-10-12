@@ -2204,6 +2204,17 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         }
     }
 
+    // ---- double-click an edit point: Trim Edit (the Trim Monitor). A single click only selects it.
+    if resp.double_clicked()
+        && matches!(tool, Tool::Selection | Tool::Ripple | Tool::Rolling)
+        && let Some(p) = resp.interact_pointer_pos()
+        && matches!(grab_at(seq, layout, p, tool, mods, roll_ripple), Grab::Edge { .. })
+        && !app.session.state.edit_points.is_empty()
+        && let Err(e) = app.session.execute("trim.edit", json!({}))
+    {
+        app.ui.status = e.to_string();
+    }
+
     // ---- double-click a nested sequence clip: open it in its own Timeline tab
     if resp.double_clicked()
         && tool == Tool::Selection

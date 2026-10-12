@@ -298,3 +298,36 @@ fn dragging_a_caption_edge_inward_trims_it() {
     assert_eq!(s1, s0, "the caption's start stayed: trimmed, not moved");
     assert!(e1 < e0, "the caption's end moved in: {e0} → {e1}");
 }
+
+/// Clicking an edge (plain or Cmd) only selects the edit point: the Program monitor stays the
+/// Program monitor, as in Premiere. Double-clicking an edge is Trim Edit and opens the Trim Monitor.
+/// Every edit point selection used to switch the Program monitor to the Trim Monitor.
+#[test]
+fn clicking_an_edge_selects_it_and_only_a_double_click_opens_the_trim_monitor() {
+    let mut d = Driver::demo();
+    let city = d.v1_clip(CITY);
+    let st = &mut d.harness.state_mut().session.state;
+    st.selection.clear();
+    st.edit_points.clear();
+    let (_, x1, y) = d.edges(city);
+    let at = pos2(x1 - 3.0, y);
+    d.drag(at, at, 0);
+    let st = &d.app().session.state;
+    assert!(st.edit_points.iter().any(|e| e.clip == ClipId(city) && e.out), "the click selected the edit point: {:?}", st.edit_points);
+    assert!(!filmcraft_engine::trim::monitor_open(&d.app().session), "a click doesn't open the Trim Monitor");
+    assert!(d.ok("ui.elements", json!({"prefix": "trimMonitor."})).as_array().is_none_or(|a| a.is_empty()), "no Trim Monitor on screen");
+    // keyboard trimming works on the selected edit without the monitor
+    let (_, e0) = d.span(city);
+    d.exec("trim.backward", json!({}));
+    assert_eq!(d.span(city).1, e0 - d.frame(), "Trim Backward moved the edit one frame");
+    assert!(!filmcraft_engine::trim::monitor_open(&d.app().session));
+    // double-click: Trim Edit
+    let (_, x1, y) = d.edges(city);
+    let at = pos2(x1 - 3.0, y);
+    d.drag(at, at, 0);
+    d.drag(at, at, 0);
+    assert!(filmcraft_engine::trim::monitor_open(&d.app().session), "a double-click opens the Trim Monitor");
+    d.frames(2);
+    let els = d.ok("ui.elements", json!({"prefix": "trimMonitor."}));
+    assert!(els.to_string().contains("trimMonitor.outgoing"), "the Trim Monitor is on screen: {els}");
+}
