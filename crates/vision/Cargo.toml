@@ -1,0 +1,17 @@
+[package]
+name = "filmcraft-vision"
+description = "FilmCraft picture analysis: a pure-Rust TensorFlow Lite interpreter (float CNN subset) and face + eye landmark detection (MediaPipe BlazeFace + Face Mesh, Apache-2.0 weights downloaded on demand)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
