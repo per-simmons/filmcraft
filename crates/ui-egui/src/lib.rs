@@ -164,6 +164,11 @@ pub struct Playback {
     pub hidden: bool,
     /// Forward playback stops here (Play In to Out, Play from Playhead to Out Point).
     pub stop_at: Option<Tick>,
+    /// The playhead the playback clock last set. When the playhead is somewhere else on the next
+    /// frame, something moved it while playing (Go to Next / Previous Edit Point, a click in the
+    /// ruler, a script): playback carries on from there, as in Premiere, instead of the clock
+    /// putting it back.
+    clock_tick: Option<Tick>,
 }
 
 /// How long (s) the audio clock may stand still during playback before the wall clock takes over.
@@ -548,7 +553,7 @@ impl FilmcraftApp {
             self.timeline_view_of = None;
             return;
         };
-        let stored = self.session.state.timeline_views.get(&active).copied();
+        let stored = self.session.state.timeline_views.get(&active).cloned();
         let v = &mut self.ui.timeline;
         let shown = filmcraft_engine::project::SequenceView {
             pps: v.target_pps,
@@ -557,35 +562,38 @@ impl FilmcraftApp {
             a_scroll: v.a_scroll,
             video_track_h: v.video_track_h,
             audio_track_h: v.audio_track_h,
+            track_heights: v.track_heights.clone(),
         };
-        let show = |v: &mut state::TimelineView, s: filmcraft_engine::project::SequenceView| {
+        let show = |v: &mut state::TimelineView, s: &filmcraft_engine::project::SequenceView| {
             (v.pps, v.target_pps, v.scroll, v.target_scroll) = (s.pps, s.pps, s.scroll, s.scroll);
             (v.v_scroll, v.a_scroll, v.video_track_h, v.audio_track_h) = (s.v_scroll, s.a_scroll, s.video_track_h, s.audio_track_h);
+            v.track_heights = s.track_heights.clone();
             (v.fit_pending, v.fit_empty) = (false, None);
         };
         if self.timeline_view_of != Some(active) {
             self.timeline_view_of = Some(active);
             match stored.and_then(|s| s.checked()) {
                 Some(s) => {
-                    show(v, s);
+                    show(v, &s);
                     self.timeline_view_last = Some(s);
                 }
                 None => {
                     let d = state::TimelineView::default();
                     (v.v_scroll, v.a_scroll, v.video_track_h, v.audio_track_h) = (0.0, 0.0, d.video_track_h, d.audio_track_h);
+                    v.track_heights.clear();
                     (v.fit_pending, v.fit_empty) = (true, None);
                     self.timeline_view_last = None;
                 }
             }
         } else if v.fit_pending {
             // the panel has not fitted the sequence yet: nothing to keep
-        } else if self.timeline_view_last != Some(shown) {
-            self.session.state.timeline_views.insert(active, shown);
+        } else if self.timeline_view_last.as_ref() != Some(&shown) {
+            self.session.state.timeline_views.insert(active, shown.clone());
             self.timeline_view_last = Some(shown);
         } else if let Some(s) = stored.filter(|s| *s != shown).and_then(|s| s.checked()) {
-            show(v, s);
+            show(v, &s);
+            self.session.state.timeline_views.insert(active, s.clone());
             self.timeline_view_last = Some(s);
-            self.session.state.timeline_views.insert(active, s);
         }
     }
 
@@ -715,6 +723,7 @@ impl FilmcraftApp {
         self.playback.speed = speed;
         self.playback.anchor_tick = self.session.playhead();
         self.playback.anchor_time = -1.0; // set when the preroll ends
+        self.playback.clock_tick = None;
         self.playback.preroll = Some(-1.0);
         self.playback.preroll_ready = false;
         if let Some(a) = self.audio.as_mut() {
@@ -743,6 +752,7 @@ impl FilmcraftApp {
 
     pub fn stop(&mut self) {
         self.playback.playing = false;
+        self.playback.clock_tick = None;
         self.playback.stop_at = None;
         self.playback.preroll = None;
         self.playback.meter.finish();
@@ -815,6 +825,9 @@ impl FilmcraftApp {
         if self.playback.anchor_time < 0.0 {
             self.playback.anchor_time = now;
         }
+        if self.playback.clock_tick.is_some_and(|t| t != self.session.playhead()) && !self.session.voiceover.recording() {
+            self.seek_while_playing(now);
+        }
         let rate = self.session.sequence_rate();
         let reading = if self.playback.audio_clock { self.audio.as_ref().and_then(|a| a.played_frames().map(|f| (f, a.sample_rate()))) } else { None };
         if self.playback.audio_clock && reading.is_none() {
@@ -875,8 +888,23 @@ impl FilmcraftApp {
             self.stop();
         } else {
             self.session.set_playhead(t);
+            // what the session keeps (it may round to a frame), not `t`
+            self.playback.clock_tick = Some(self.session.playhead());
         }
         ctx.request_repaint();
+    }
+
+    /// The playhead was moved while playing: keep playing from where it is now (the clock and the
+    /// sound restart there; the play does not pause or preroll again).
+    fn seek_while_playing(&mut self, now: f64) {
+        self.playback.clock_tick = None;
+        self.playback.anchor_tick = self.session.playhead();
+        self.playback.anchor_time = now;
+        self.playback.audio_seen = (0, now);
+        if self.playback.audio_clock {
+            self.playback.audio_clock = false;
+            self.start_audio();
+        }
     }
 
     // ---------------------------------------------------------------- textures

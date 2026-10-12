@@ -1192,7 +1192,7 @@ pub struct Project {
 
 /// How a sequence is shown in the Timeline panel: its zoom, scroll position and track heights.
 /// Each open sequence keeps its own (as Premiere's sequence tabs do).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SequenceView {
     /// Zoom: points per second.
     pub pps: f64,
@@ -1203,14 +1203,22 @@ pub struct SequenceView {
     pub v_scroll: f32,
     #[serde(default)]
     pub a_scroll: f32,
+    /// Default height of the video and audio tracks, in points.
     pub video_track_h: f32,
     pub audio_track_h: f32,
+    /// Tracks resized on their own (Option + wheel over the track, dragging its header's edge):
+    /// track id → height in points. Tracks not listed have the default height of their kind.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub track_heights: BTreeMap<u64, f32>,
 }
+
+/// Most tracks a view keeps a height of its own for (a project file is not trusted).
+pub const MAX_TRACK_HEIGHTS: usize = 1024;
 
 impl SequenceView {
     /// The view with every number brought into a usable range, or `None` when a number is not
     /// finite. Views are read from project files, so nothing in them is trusted.
-    pub fn checked(self) -> Option<SequenceView> {
+    pub fn checked(&self) -> Option<SequenceView> {
         let all = [self.pps, self.scroll, self.v_scroll as f64, self.a_scroll as f64, self.video_track_h as f64, self.audio_track_h as f64];
         if all.iter().any(|x| !x.is_finite()) {
             return None;
@@ -1222,6 +1230,7 @@ impl SequenceView {
             a_scroll: self.a_scroll.clamp(0.0, 1e6),
             video_track_h: self.video_track_h.clamp(8.0, 600.0),
             audio_track_h: self.audio_track_h.clamp(8.0, 600.0),
+            track_heights: self.track_heights.iter().filter(|(_, h)| h.is_finite()).take(MAX_TRACK_HEIGHTS).map(|(t, h)| (*t, h.clamp(8.0, 600.0))).collect(),
         })
     }
 }

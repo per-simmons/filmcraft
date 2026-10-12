@@ -21,11 +21,11 @@ Premiere has these as keys only (most are not in a menu). Modules: `filmcraft_en
 
 | Group | Commands | Keys |
 |---|---|---|
-| Navigation | Go to Next/Previous Edit Point (targeted tracks), …on Any Track, Go to Selected Clip Start/End, Reveal Nested Sequence | Down/Up, Shift+Down/Up, Shift+Home/End, Cmd+Alt+F |
+| Navigation | Go to Next/Previous Edit Point (targeted tracks), …on Any Track (also while playing: the playhead jumps and playback carries on from there), Go to Selected Clip Start/End, Reveal Nested Sequence | Down/Up, Shift+Down/Up, Shift+Home/End, Cmd+Alt+F |
 | Selection | Select Clip at Playhead, Select Next/Previous Clip, Select Find Box, Open Search | D, Cmd+Down/Up, Shift+F, Cmd+Shift+F |
 | Trimming | Extend Previous/Next Edit To Playhead; Nudge Clip Selection Left/Right One/Five Frames, Up/Down; Slip and Slide Clip Selection Left/Right One/Five Frames | Shift+Q/W; Cmd+(Shift+)Left/Right, Alt+Up/Down; Cmd+Alt+(Shift+)Left/Right; Alt+(Shift+), / . (Timeline) |
 | Targeting | Toggle All Video/Audio Targets, Toggle All Source Video/Audio; Toggle Target Video/Audio 1–8, Move All Video/Audio Targets Up/Down, Toggle Mute/Solo for targeted audio, Toggle Track Output for targeted video (unbound, as in Premiere) | Cmd+0/9, Cmd+Alt+0/9 |
-| Tracks | Expand/Minimize All Tracks (again restores), Increase/Decrease Video/Audio Tracks Height, Show Next/Previous Screen | Shift+= / Shift+-, Cmd+= / Cmd+- / Alt+= / Alt+-, PageDown/PageUp (Timeline) |
+| Tracks | Expand/Minimize All Tracks (again restores), Increase/Decrease Video/Audio Tracks Height, Show Next/Previous Screen; one track's height: Option + wheel over its header or its clips (Shift: every track of its kind, Cmd: finer; Settings ▸ Timeline ▸ "Option + wheel over the tracks" = Zooms restores Premiere's zoom over the clips), Shift + wheel over a header (every track of its kind), `timeline.setTrackHeight {track, height \| wheel, all?}` | Shift+= / Shift+-, Cmd+= / Cmd+- / Alt+= / Alt+-, PageDown/PageUp (Timeline) |
 | Monitors | Zoom Program/Source Monitor to 100%/Fit, Toggle Full Screen, Play In to Out with Preroll/Postroll, Play from Playhead to Out Point, Export Frame, Set/Clear Poster Frame | Cmd+Shift+1/0, Cmd+Alt+Shift+1/0, Ctrl+`, Shift+Space, Ctrl+Space, Shift+E, Cmd+P / Alt+P |
 | Panels | Maximize or Restore Active Frame / Frame Under Cursor, Select Next/Previous Panel, Toggle Source/Program Monitor Focus, Workspaces 7–9 | Shift+`, `, Ctrl+Shift+. / ,, Alt+Shift+7/8/9 |
 | Audio | Increase/Decrease Clip Volume (1 dB) and …Many (Settings ▸ Audio ▸ Large Volume Adjustment), Nudge Volume ±1/±3 dB, Toggle Audio During Scrubbing | ] / [, Shift+] / Shift+[, Shift+S |

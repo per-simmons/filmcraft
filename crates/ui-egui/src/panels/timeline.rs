@@ -24,6 +24,7 @@ use crate::theme::Tokens;
 
 use super::timeline_hit::{EdgeKind, Grab, edge_geometry, grab_at};
 pub use super::timeline_hit::{Hit, ROLL_PX, hit, selection_trim_kind};
+use super::waveform::{self, Peaks};
 
 const TOP_H: f32 = 58.0; // timecode + toolbar (left) / ruler (right)
 const RULER_H: f32 = 44.0;
@@ -42,16 +43,13 @@ pub struct TlState {
     pub layout: Option<Layout>,
     /// Snap indicator x (screen) this frame.
     snap_x: Option<f32>,
-    pub peaks: Arc<Mutex<HashMap<ItemId, Arc<Vec<(f32, f32)>>>>>,
+    pub peaks: Arc<Mutex<HashMap<ItemId, Arc<Peaks>>>>,
     peaks_pending: Arc<Mutex<Vec<ItemId>>>,
     /// Nested sequences have waveforms too, of their mix. Unlike media a sequence changes: this is
     /// the content key (see [`sequence_audio_key`]) the cached peaks of each sequence were made
     /// from, and the key worked out for the session revision last seen.
     seq_peak_keys: Arc<Mutex<HashMap<ItemId, u64>>>,
     seq_keys_seen: HashMap<ItemId, (u64, u64)>,
-    /// Source peak of each cached peak list (keyed by the list's address), for the waveform
-    /// display gain: scanning the whole source per clip per frame cost more than drawing.
-    peak_max: HashMap<ItemId, (usize, f32)>,
     zoom_anchor: Option<(f64, f32)>,
 }
 
@@ -64,7 +62,6 @@ impl TlState {
         self.peaks_pending = Default::default();
         self.seq_peak_keys = Default::default();
         self.seq_keys_seen.clear();
-        self.peak_max.clear();
     }
 }
 
@@ -161,6 +158,8 @@ pub struct Layout {
     pub scroll: f64,
     /// The y of the divider between the video tracks (above) and the audio tracks (below).
     pub split_y: f32,
+    /// Top of the video tracks and bottom of the audio tracks (rows scrolled past them are hidden).
+    pub tracks_y: (f32, f32),
 }
 
 impl Layout {
@@ -172,6 +171,14 @@ impl Layout {
     }
     pub fn row_at(&self, y: f32) -> Option<&Row> {
         self.rows.iter().find(|r| r.rect.min.y <= y && y < r.rect.max.y)
+    }
+    /// The track shown at `y` (its visible part: not one scrolled under the other half, the
+    /// divider, the caption tracks or the Mix row).
+    pub fn visible_row_at(&self, y: f32) -> Option<&Row> {
+        if y < self.tracks_y.0 || y >= self.tracks_y.1 {
+            return None;
+        }
+        self.row_at(y).filter(|r| if r.kind == TrackKind::Video { y < self.split_y } else { y >= self.split_y + DIVIDER_H })
     }
 }
 
@@ -304,27 +311,34 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let split_y = tracks_area.min.y + (tracks_area.height() - DIVIDER_H) * app.ui.timeline.split;
     let video_area = Rect::from_min_max(pos2(rect.min.x, tracks_area.min.y), pos2(content.max.x, split_y));
     let audio_area = Rect::from_min_max(pos2(rect.min.x, split_y + DIVIDER_H), pos2(content.max.x, tracks_area.max.y - MASTER_H));
-    let vh = app.ui.timeline.video_track_h;
-    let ah = app.ui.timeline.audio_track_h;
     let mut rows = Vec::new();
+    // Each track has its own height (Option + wheel, a header's edge); the rest the kind's default.
+    let vhs: Vec<f32> = seq.video_tracks.iter().map(|tr| app.ui.timeline.track_height(tr.id.0, true)).collect();
+    let ahs: Vec<f32> = seq.audio_tracks.iter().map(|tr| app.ui.timeline.track_height(tr.id.0, false)).collect();
     // Video: V1 at the bottom of the video area, stacking upward; v_scroll shifts up.
-    let nv = seq.video_tracks.len();
-    let video_total = nv as f32 * vh;
+    let video_total: f32 = vhs.iter().sum();
     let v_off = (video_area.height() - video_total).max(0.0);
     let max_vs = (video_total - video_area.height()).max(0.0);
     app.ui.timeline.v_scroll = app.ui.timeline.v_scroll.clamp(0.0, max_vs);
-    for (i, tr) in seq.video_tracks.iter().enumerate() {
-        let top = video_area.min.y + v_off + (nv - 1 - i) as f32 * vh - (max_vs - app.ui.timeline.v_scroll);
-        rows.push(Row { track: tr.id, kind: TrackKind::Video, index: i, rect: Rect::from_min_max(pos2(content.min.x, top), pos2(content.max.x, top + vh)) });
+    let mut bottom = video_area.min.y + v_off + video_total - (max_vs - app.ui.timeline.v_scroll);
+    for (i, (tr, h)) in seq.video_tracks.iter().zip(&vhs).enumerate() {
+        rows.push(Row {
+            track: tr.id,
+            kind: TrackKind::Video,
+            index: i,
+            rect: Rect::from_min_max(pos2(content.min.x, bottom - h), pos2(content.max.x, bottom)),
+        });
+        bottom -= h;
     }
-    let na = seq.audio_tracks.len();
-    let max_as = (na as f32 * ah - audio_area.height()).max(0.0);
+    let audio_total: f32 = ahs.iter().sum();
+    let max_as = (audio_total - audio_area.height()).max(0.0);
     app.ui.timeline.a_scroll = app.ui.timeline.a_scroll.clamp(0.0, max_as);
-    for (i, tr) in seq.audio_tracks.iter().enumerate() {
-        let top = audio_area.min.y + i as f32 * ah - app.ui.timeline.a_scroll;
-        rows.push(Row { track: tr.id, kind: TrackKind::Audio, index: i, rect: Rect::from_min_max(pos2(content.min.x, top), pos2(content.max.x, top + ah)) });
+    let mut top = audio_area.min.y - app.ui.timeline.a_scroll;
+    for (i, (tr, h)) in seq.audio_tracks.iter().zip(&ahs).enumerate() {
+        rows.push(Row { track: tr.id, kind: TrackKind::Audio, index: i, rect: Rect::from_min_max(pos2(content.min.x, top), pos2(content.max.x, top + h)) });
+        top += h;
     }
-    let layout = Layout { content, ruler, rows: rows.clone(), pps, scroll, split_y };
+    let layout = Layout { content, ruler, rows: rows.clone(), pps, scroll, split_y, tracks_y: (video_area.min.y, audio_area.max.y) };
     app.tl.layout = Some(layout.clone());
 
     // ---- backgrounds
@@ -672,9 +686,9 @@ fn draw_clip(
             }
         }
     }
-    // waveform (audio): rectified, lower 40 %
+    // waveform (audio): every channel, filling the clip below its name
     if kind == TrackKind::Audio && app.ui.timeline.show_waveforms && w > 3.0 {
-        draw_waveform(app, p, body, it, if inr { Color32::from_rgb(0xc7, 0xe9, 0xfa) } else { Color32::from_rgb(0x79, 0xc0, 0xf9) });
+        draw_waveform(app, ctx, p, body, it, waveform_color(fill));
     }
     let clip_p = p.with_clip_rect(body.shrink2(vec2(1.0, 0.0)).intersect(p.clip_rect()));
     // name band
@@ -730,65 +744,52 @@ fn draw_clip(
     }
 }
 
-fn draw_waveform(app: &mut FilmcraftApp, p: &egui::Painter, body: Rect, it: &TrackItem, col: Color32) {
-    let Some(peaks) = request_peaks(app, it.item) else { return };
-    let spp = 256.0;
-    let sr = 48_000.0;
-    let zone_h = (body.height() * 0.42).max(8.0);
-    let area = Rect::from_min_max(pos2(body.min.x + 1.0, body.max.y - zone_h - 1.0), pos2(body.max.x - 1.0, body.max.y - 1.0));
-    let clip = p.clip_rect().intersect(area);
-    if clip.width() <= 0.0 {
+/// The waveform colour on a clip of colour `fill`: a pale tint of the clip's own colour, for
+/// strong contrast whatever the label (Premiere draws the waveform in a light shade of the clip).
+fn waveform_color(fill: Color32) -> Color32 {
+    lighten(fill, 0.72)
+}
+
+fn draw_waveform(app: &mut FilmcraftApp, ctx: &egui::Context, p: &egui::Painter, body: Rect, it: &TrackItem, col: Color32) {
+    // below the name band when the clip is tall enough to show one, else the whole clip
+    let top = if body.height() >= 34.0 { body.min.y + 16.0 } else { body.min.y + 1.0 };
+    let area = Rect::from_min_max(pos2(body.min.x + 1.0, top), pos2(body.max.x - 1.0, body.max.y - 1.0));
+    if area.height() < 2.0 {
         return;
     }
-    let key = Arc::as_ptr(&peaks) as usize;
-    let peak = match app.tl.peak_max.get(&it.item) {
-        Some(&(k, v)) if k == key => v,
-        _ => {
-            let v = peaks.iter().fold(0f32, |m, (a, b)| m.max(a.abs()).max(b.abs()));
-            app.tl.peak_max.insert(it.item, (key, v));
-            v
+    let lanes = match request_peaks(app, it.item) {
+        Some(peaks) => {
+            let style = waveform::Style {
+                rectified: app.session.prefs.timeline.rectified_audio_waveforms,
+                log: app.ui.extras.dynamic_waveforms,
+                gain: waveform_display_gain(peaks.max_abs(), it.gain_db),
+                color: col,
+                pixels_per_point: ctx.pixels_per_point(),
+            };
+            let per_tick = 48_000.0 / waveform::BUCKET as f64 / TICKS_PER_SECOND as f64;
+            let width = body.width().max(1e-3) as f64;
+            let pos_at = |x: f32| {
+                let f = ((x - body.min.x) as f64 / width).clamp(0.0, 1.0);
+                let t = it.start + Tick((it.duration.0 as f64 * f) as i64);
+                it.source_time_at(t).0 as f64 * per_tick
+            };
+            waveform::paint(p, area, p.clip_rect(), &peaks, pos_at, style)
         }
+        None => Vec::new(),
     };
-    let gain = waveform_display_gain(peak, it.gain_db);
-    let dynamic = app.ui.extras.dynamic_waveforms;
-    let mut mesh = egui::Mesh::default();
-    let dur_px = body.width().max(1.0);
-    for x in (clip.min.x.floor() as i32)..(clip.max.x.ceil() as i32) {
-        let f0 = (x as f32 - body.min.x) / dur_px;
-        let f1 = (x as f32 + 1.0 - body.min.x) / dur_px;
-        let t0 = it.start + Tick((it.duration.0 as f64 * f0 as f64) as i64);
-        let t1 = it.start + Tick((it.duration.0 as f64 * f1 as f64) as i64);
-        let s0 = (it.source_time_at(t0).seconds() * sr / spp) as usize;
-        let s1 = ((it.source_time_at(t1).seconds() * sr / spp) as usize).max(s0 + 1);
-        let mut m = 0f32;
-        for (a, b) in peaks.iter().skip(s0).take(s1 - s0) {
-            m = m.max(a.abs()).max(b.abs());
-        }
-        // View ▸ Dynamic Audio Waveforms (default): logarithmic scale, −48 dB → 0, 0 dB → full;
-        // off: linear amplitude
-        let h = if dynamic {
-            let db = 20.0 * (m * gain).max(1e-5).log10();
-            ((db + 48.0) / 48.0).clamp(0.0, 1.0) * area.height()
-        } else {
-            (m * gain).clamp(0.0, 1.0) * area.height()
-        };
-        if h > 0.3 {
-            mesh.add_colored_rect(Rect::from_min_max(pos2(x as f32, area.max.y - h), pos2(x as f32 + 1.0, area.max.y)), col);
-        }
-    }
-    p.add(mesh);
-    // channel label box
-    let cb = Rect::from_min_size(pos2(body.min.x + 3.0, body.max.y - 11.0), vec2(8.0, 9.0));
+    // channel numbers at the bottom left of each lane
     if body.width() > 30.0 {
-        p.rect_filled(cb, 1.0, Color32::from_black_alpha(160));
-        p.text(cb.center(), Align2::CENTER_CENTER, "1", Tokens::ui(7.5), Color32::from_rgb(0xd9, 0xd9, 0xd9));
+        for (i, lane) in lanes.iter().enumerate().filter(|(_, l)| l.height() >= 16.0) {
+            let cb = Rect::from_min_size(pos2(body.min.x + 3.0, lane.max.y - 10.0), vec2(8.0, 9.0));
+            p.rect_filled(cb, 1.0, Color32::from_black_alpha(160));
+            p.text(cb.center(), Align2::CENTER_CENTER, format!("{}", i + 1), Tokens::ui(7.5), Color32::from_rgb(0xd9, 0xd9, 0xd9));
+        }
     }
-    // volume rubber band (white line with a black shadow) at mid-height of the upper zone
+    // volume rubber band (white line with a black shadow), over the waveform
     let level = it.effect("volume").map(|e| e.f64_at("level", it.source_in)).unwrap_or(0.0);
-    let upper = Rect::from_min_max(pos2(body.min.x, body.min.y + 16.0), pos2(body.max.x, area.min.y));
-    if upper.height() > 6.0 {
+    if area.height() > 6.0 {
         let norm = ((level + 60.0) / 66.0).clamp(0.0, 1.0) as f32;
-        let y = upper.max.y - norm * upper.height();
+        let y = area.max.y - norm * area.height();
         let cp = p.with_clip_rect(body.intersect(p.clip_rect()));
         cp.line_segment([pos2(body.min.x, y + 1.0), pos2(body.max.x, y + 1.0)], Stroke::new(1.0, Color32::BLACK));
         cp.line_segment([pos2(body.min.x, y), pos2(body.max.x, y)], Stroke::new(1.0, Color32::WHITE));
@@ -819,7 +820,7 @@ fn sequence_audio_key(project: &filmcraft_project::Project, item: ItemId) -> u64
 /// Waveform peaks of a nested sequence's mix, in the same form as a media item's (min, max per
 /// 256 samples at 48 kHz). They are mixed in the background, and again whenever the sequence's
 /// sound changes; until the new ones are ready the old ones stay on show.
-fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Vec<(f32, f32)>>> {
+fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Peaks>> {
     let revision = app.session.revision;
     let key = match app.tl.seq_keys_seen.get(&item) {
         Some(&(rev, key)) if rev == revision => key,
@@ -853,19 +854,18 @@ fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Ve
             // one peak per 256 samples at 48 kHz, whatever the sequence's own rate
             let bucket = ((256u64 * sr as u64) / 48_000).max(1) as usize;
             let chunk = (bucket * 750).max(1);
-            let mut out = Vec::with_capacity(total / bucket + 1);
+            let mut out: Vec<Vec<(f32, f32)>> = Vec::new();
             let mut s = 0usize;
             while s < total {
                 let n = chunk.min(total - s);
                 let buf = filmcraft_render::audio::mix_sequence(&project, seq, s as i64, n, &provider);
-                let ch = buf.channels.first()?;
-                for c in ch.chunks(bucket) {
-                    let (lo, hi) = c.iter().fold((0f32, 0f32), |(l, h), v| (l.min(*v), h.max(*v)));
-                    out.push((lo, hi));
+                if buf.channels.is_empty() {
+                    return None;
                 }
+                push_channel_peaks(&mut out, &buf.channels, bucket, total);
                 s += n;
             }
-            Some(out)
+            Some(Peaks::from_channels(out))
         }));
         if let Ok(Some(out)) = mixed {
             peaks.lock().unwrap_or_else(|e| e.into_inner()).insert(item, Arc::new(out));
@@ -880,7 +880,28 @@ fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Ve
     have
 }
 
-pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Vec<(f32, f32)>>> {
+/// Append the peaks of one block of audio to per-channel peak lists (channels beyond
+/// [`waveform::MAX_CHANNELS`] are dropped; a channel that appears later is padded with silence).
+fn push_channel_peaks(out: &mut Vec<Vec<(f32, f32)>>, channels: &[Vec<f32>], bucket: usize, total: usize) {
+    let had = out.first().map_or(0, Vec::len);
+    for (c, ch) in channels.iter().take(waveform::MAX_CHANNELS).enumerate() {
+        if out.len() <= c {
+            let mut v = Vec::with_capacity((total / bucket.max(1) + 1).min(1 << 26));
+            v.resize(had, (0.0, 0.0));
+            out.push(v);
+        }
+        if let Some(v) = out.get_mut(c) {
+            waveform::block_peaks(ch, bucket, v);
+        }
+    }
+    // every channel stays as long as the first
+    let len = out.first().map_or(0, Vec::len);
+    for v in out.iter_mut() {
+        v.resize(len, (0.0, 0.0));
+    }
+}
+
+pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Peaks>> {
     if app.session.project.sequence(item).is_some() {
         return request_sequence_peaks(app, item);
     }
@@ -902,23 +923,23 @@ pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<
     let run = move || {
         let sr = 48_000u32;
         let total = dur.to_units_floor(sr as i64).max(0) as usize;
-        let mut out = Vec::with_capacity(total / 256 + 1);
-        let chunk = 48_000 * 4;
-        let mut s = 0usize;
-        while s < total {
-            let n = chunk.min(total - s);
-            match src.audio(s as i64, n, sr) {
-                Ok(buf) => {
-                    let ch = buf.channels.first().cloned().unwrap_or_default();
-                    for c in ch.chunks(256) {
-                        let (lo, hi) = c.iter().fold((0f32, 0f32), |(l, h), v| (l.min(*v), h.max(*v)));
-                        out.push((lo, hi));
-                    }
+        // every channel, a pair per `BUCKET` samples (4 s blocks are whole buckets)
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out: Vec<Vec<(f32, f32)>> = Vec::new();
+            let chunk = 48_000 * 4;
+            let mut s = 0usize;
+            while s < total {
+                let n = chunk.min(total - s);
+                match src.audio(s as i64, n, sr) {
+                    Ok(buf) if !buf.channels.is_empty() => push_channel_peaks(&mut out, &buf.channels, waveform::BUCKET, total),
+                    Ok(_) => {}
+                    Err(_) => break,
                 }
-                Err(_) => break,
+                s += n;
             }
-            s += n;
-        }
+            Peaks::from_channels(out)
+        }));
+        let out = built.unwrap_or_default();
         peaks.lock().unwrap_or_else(|e| e.into_inner()).insert(item, Arc::new(out));
         pending.lock().unwrap_or_else(|e| e.into_inner()).retain(|i| *i != item);
     };
@@ -1116,9 +1137,11 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
             }
             if eresp.dragged() {
+                // that track only, as in Premiere (video tracks grow upward, audio downward)
                 let d = eresp.drag_delta().y * if r.kind == TrackKind::Video { -1.0 } else { 1.0 };
-                let h = if r.kind == TrackKind::Video { &mut app.ui.timeline.video_track_h } else { &mut app.ui.timeline.audio_track_h };
-                *h = (*h + d).clamp(22.0, 220.0);
+                let v = &mut app.ui.timeline;
+                let h = v.track_height(r.track.0, r.kind == TrackKind::Video);
+                v.set_track_height(r.track.0, h + d);
             }
         }
         let name_area = Rect::from_min_max(pos2(hrect.min.x + 90.0, hrect.min.y + 26.0), hrect.max).intersect(visible);
@@ -1127,8 +1150,9 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
             app.auto.add(&format!("timeline.track.{label}.header"), name_area, "Track name (double-click: expand / collapse)");
         }
         if resp.double_clicked() {
-            let h = if r.kind == TrackKind::Video { &mut app.ui.timeline.video_track_h } else { &mut app.ui.timeline.audio_track_h };
-            *h = if *h < 50.0 { 64.0 } else { 30.0 };
+            let v = &mut app.ui.timeline;
+            let h = v.track_height(r.track.0, r.kind == TrackKind::Video);
+            v.set_track_height(r.track.0, if h < 50.0 { 64.0 } else { 30.0 });
         }
     }
     // column separator
@@ -1191,6 +1215,20 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
                 app.auto.add("timeline.settings.showThumbnails", c.rect, "Show Video Thumbnails");
                 let c = ui.checkbox(&mut app.ui.timeline.show_waveforms, "Show Audio Waveform");
                 app.auto.add("timeline.settings.showWaveforms", c.rect, "Show Audio Waveform");
+                let mut rect = app.session.prefs.timeline.rectified_audio_waveforms;
+                let c = ui.checkbox(&mut rect, "Rectified Audio Waveforms");
+                app.auto.add("timeline.settings.rectifiedWaveforms", c.rect, "Rectified Audio Waveforms");
+                if c.changed()
+                    && let Err(e) = app.session.execute("prefs.set", json!({"key": "timeline.rectifiedAudioWaveforms", "value": rect}))
+                {
+                    app.ui.status = e.to_string();
+                }
+                let mut log = app.ui.extras.dynamic_waveforms;
+                let c = ui.checkbox(&mut log, "Logarithmic Waveform Scaling");
+                app.auto.add("timeline.settings.logWaveforms", c.rect, "Logarithmic Waveform Scaling");
+                if c.changed() {
+                    app.ui.extras.dynamic_waveforms = log;
+                }
                 ui.separator();
                 let mut te = app.session.state.show_through_edits;
                 let c = ui.checkbox(&mut te, "Show Through Edits");
@@ -1202,14 +1240,16 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
                 let b = ui.button("Expand All Tracks");
                 app.auto.add("timeline.settings.expandAllTracks", b.rect, "Expand All Tracks");
                 if b.clicked() {
-                    app.ui.timeline.video_track_h = 64.0;
-                    app.ui.timeline.audio_track_h = 64.0;
+                    let v = &mut app.ui.timeline;
+                    v.set_kind_height(true, &kind_track_ids(seq, true), 64.0);
+                    v.set_kind_height(false, &kind_track_ids(seq, false), 64.0);
                 }
                 let b = ui.button("Minimize All Tracks");
                 app.auto.add("timeline.settings.minimizeAllTracks", b.rect, "Minimize All Tracks");
                 if b.clicked() {
-                    app.ui.timeline.video_track_h = 26.0;
-                    app.ui.timeline.audio_track_h = 26.0;
+                    let v = &mut app.ui.timeline;
+                    v.set_kind_height(true, &kind_track_ids(seq, true), 26.0);
+                    v.set_kind_height(false, &kind_track_ids(seq, false), 26.0);
                 }
             });
         }
@@ -1722,6 +1762,70 @@ fn wheel_input(ctx: &egui::Context) -> WheelInput {
     })
 }
 
+/// Option + wheel over a track: resize it (or, `all`, every track of its kind, to its new height).
+fn resize_by_wheel(app: &mut FilmcraftApp, seq: &Sequence, track: TrackId, video: bool, dy: f32, all: bool, fine: bool) {
+    let v = &mut app.ui.timeline;
+    let h = crate::state::wheel_track_height(v.track_height(track.0, video), dy, fine);
+    if all {
+        v.set_kind_height(video, &kind_track_ids(seq, video), h);
+    } else {
+        v.set_track_height(track.0, h);
+    }
+}
+
+/// The ids of the video (or audio) tracks of `seq`.
+pub(crate) fn kind_track_ids(seq: &Sequence, video: bool) -> Vec<u64> {
+    let tracks = if video { &seq.video_tracks } else { &seq.audio_tracks };
+    tracks.iter().map(|t| t.id.0).collect()
+}
+
+/// A track named by a parameter: its id, or "V1" / "A2" (kind and 1-based number). With whether
+/// it is a video track.
+fn track_named(seq: &Sequence, v: &Value) -> Option<(TrackId, bool)> {
+    if let Some(id) = v.as_u64() {
+        let video = seq.video_tracks.iter().any(|t| t.id.0 == id);
+        return (video || seq.audio_tracks.iter().any(|t| t.id.0 == id)).then_some((TrackId(id), video));
+    }
+    let name = v.as_str()?.trim();
+    let mut rest = name.chars();
+    let video = match rest.next()? {
+        'v' | 'V' => true,
+        'a' | 'A' => false,
+        _ => return None,
+    };
+    let i: usize = rest.as_str().parse().ok()?;
+    let tracks = if video { &seq.video_tracks } else { &seq.audio_tracks };
+    tracks.get(i.checked_sub(1)?).map(|t| (t.id, video))
+}
+
+/// `timeline.setTrackHeight {track, height | wheel, all?, fine?}`: set the height of one track
+/// (`track`: id or "V1" / "A2") in points, or change it as Option + wheel by `wheel` points
+/// (positive = taller; `fine` as with Cmd held). `all: true` gives every track of that kind the
+/// result (as Shift + Option + wheel). Heights are clamped to 22…400. Returns the track's label and
+/// height and the kind's default.
+pub(crate) fn set_track_height_command(app: &mut FilmcraftApp, params: &Value) -> Result<Value, String> {
+    let seq = app.session.active_sequence().ok_or("no sequence is open")?.clone();
+    let tv = params.get("track").ok_or("`track` is required (a track id, or \"V1\" / \"A2\")")?;
+    let (track, video) = track_named(&seq, tv).ok_or_else(|| format!("no track {tv} in this sequence"))?;
+    let num = |k: &str| params.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
+    let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let v = &mut app.ui.timeline;
+    let h = match (num("height"), num("wheel")) {
+        (Some(h), _) => h as f32,
+        (None, Some(d)) => {
+            crate::state::wheel_track_height(v.track_height(track.0, video), d as f32, params.get("fine").and_then(Value::as_bool).unwrap_or(false))
+        }
+        (None, None) => return Err("give `height` (points) or `wheel` (points of Option + wheel)".into()),
+    };
+    let h = if all { v.set_kind_height(video, &kind_track_ids(&seq, video), h) } else { v.set_track_height(track.0, h) };
+    Ok(json!({
+        "track": filmcraft_edit::track_label(&seq, track),
+        "height": h,
+        "videoTrackHeight": v.video_track_h,
+        "audioTrackHeight": v.audio_track_h,
+    }))
+}
+
 fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &Layout, rect: Rect) {
     let ctx = ui.ctx().clone();
     let area = Rect::from_min_max(pos2(layout.content.min.x, layout.ruler.min.y), layout.content.max);
@@ -1746,14 +1850,31 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
     // ---- wheel, as in Premiere Pro on macOS (checked in 26.5.2):
     //   wheel            the tracks under the pointer, up and down
     //   Cmd + wheel      the Timeline, sideways
-    //   Option + wheel   zoom about the pointer
+    //   Option + wheel   zoom about the pointer (over the ruler; over the tracks see below)
     // Settings ▸ Timeline ▸ Timeline Mouse Scrolling "Horizontal" swaps the first two. A sideways
     // gesture (trackpad swipe, tilt wheel, Shift + wheel) always scrolls sideways; a pinch zooms.
+    // Track heights (Premiere: Option + wheel over a track header resizes that track, Shift
+    // resizes every track of its kind):
+    //   Option + wheel over a track header, or over its clips (Settings ▸ Timeline ▸ "Option +
+    //   wheel over the tracks", default) resizes that track, and nothing else moves;
+    //   + Shift: every video (or audio) track; + Cmd: in finer steps;
+    //   Shift + wheel over a track header: every track of its kind.
     if ui.rect_contains_pointer(rect)
         && let Some(p) = ctx.pointer_hover_pos()
     {
         let w = wheel_input(&ctx);
-        if (w.pinch - 1.0).abs() > 1e-4 || (w.alt && w.delta.y != 0.0) {
+        let pinch = (w.pinch - 1.0).abs() > 1e-4;
+        let over_header = p.x < layout.content.min.x;
+        let alt_resizes = over_header || app.session.prefs.timeline.option_wheel_over_tracks != "zoom";
+        let resize = if pinch { None } else { layout.visible_row_at(p.y).filter(|_| (w.alt && alt_resizes) || (w.shift && over_header)) };
+        if let Some(row) = resize {
+            // Shift turns a mouse wheel sideways on macOS: take whichever way it turned
+            let dy = if w.shift && w.delta.y == 0.0 { w.delta.x } else { w.delta.y };
+            if dy != 0.0 {
+                let (track, video) = (row.track, row.kind == TrackKind::Video);
+                resize_by_wheel(app, seq, track, video, dy, w.shift, w.command);
+            }
+        } else if pinch || (w.alt && w.delta.y != 0.0) {
             let f = if (w.pinch - 1.0).abs() > 1e-4 { w.pinch as f64 } else { (1.0_f64 + w.delta.y as f64 * 0.01).clamp(0.5, 2.0) };
             let anchor_t = layout.tick_at(p.x).seconds();
             let v = &mut app.ui.timeline;

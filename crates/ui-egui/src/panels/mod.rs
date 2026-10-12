@@ -52,6 +52,7 @@ pub mod timeline_hit;
 pub mod tools;
 pub mod trim_monitor;
 pub mod voiceover;
+pub mod waveform;
 pub mod workspaces;
 
 use egui::{Align2, Color32, Rect};

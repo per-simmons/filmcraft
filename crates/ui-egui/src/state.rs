@@ -186,8 +186,13 @@ pub struct TimelineView {
     pub a_scroll: f32,
     /// Fraction of the track area given to video tracks.
     pub split: f32,
+    /// Default height of the video / audio tracks (points).
     pub video_track_h: f32,
     pub audio_track_h: f32,
+    /// Tracks resized on their own (Option + wheel, dragging a header's edge, double-clicking a
+    /// header, `timeline.setTrackHeight`): track id → height. The rest use the defaults above.
+    #[serde(default)]
+    pub track_heights: std::collections::BTreeMap<u64, f32>,
     pub header_w: f32,
     pub show_thumbnails: bool,
     pub show_waveforms: bool,
@@ -204,7 +209,57 @@ pub struct TimelineView {
     pub track_lanes: std::collections::BTreeMap<u64, String>,
 }
 
+/// Smallest and largest track height (points).
+pub const TRACK_H_MIN: f32 = 22.0;
+pub const TRACK_H_MAX: f32 = 400.0;
+
+/// Wheel points (Option + wheel) that make a track e (2.718…) times taller: a 40 point mouse
+/// notch is about +22 %, so a track goes from the smallest to the largest height in about
+/// fourteen notches, and a trackpad's small steps resize it smoothly.
+const WHEEL_PTS_PER_E: f32 = 200.0;
+
+/// A track's height after Option + wheel by `dy` points (positive = wheel up / away: taller).
+/// The change is proportional to the height, so it feels the same on short and tall tracks;
+/// `fine` (Cmd held as well) moves a quarter as far. Always within [`TRACK_H_MIN`]…[`TRACK_H_MAX`],
+/// whatever `h` and `dy` are (non-finite input gives a finite height).
+pub fn wheel_track_height(h: f32, dy: f32, fine: bool) -> f32 {
+    let h = if h.is_finite() { h.clamp(TRACK_H_MIN, TRACK_H_MAX) } else { TRACK_H_MIN };
+    if !dy.is_finite() {
+        return h;
+    }
+    let k = if fine { 0.25 } else { 1.0 };
+    let f = (dy * k / WHEEL_PTS_PER_E).clamp(-20.0, 20.0).exp();
+    (h * f).clamp(TRACK_H_MIN, TRACK_H_MAX)
+}
+
 impl TimelineView {
+    /// Height of a track (its own, or the default of its kind).
+    pub fn track_height(&self, track: u64, video: bool) -> f32 {
+        let d = if video { self.video_track_h } else { self.audio_track_h };
+        let h = self.track_heights.get(&track).copied().unwrap_or(d);
+        if h.is_finite() { h.clamp(TRACK_H_MIN, TRACK_H_MAX) } else { TRACK_H_MIN }
+    }
+
+    /// Give one track a height of its own (clamped). Returns the height set.
+    pub fn set_track_height(&mut self, track: u64, h: f32) -> f32 {
+        let h = if h.is_finite() { h.clamp(TRACK_H_MIN, TRACK_H_MAX) } else { TRACK_H_MIN };
+        if self.track_heights.len() < filmcraft_engine::project::MAX_TRACK_HEIGHTS || self.track_heights.contains_key(&track) {
+            self.track_heights.insert(track, h);
+        }
+        h
+    }
+
+    /// Set the height of every track of a kind: the kind's default, and no track keeps its own.
+    /// `tracks` are the ids of that kind's tracks.
+    pub fn set_kind_height(&mut self, video: bool, tracks: &[u64], h: f32) -> f32 {
+        let h = if h.is_finite() { h.clamp(TRACK_H_MIN, TRACK_H_MAX) } else { TRACK_H_MIN };
+        *(if video { &mut self.video_track_h } else { &mut self.audio_track_h }) = h;
+        for t in tracks {
+            self.track_heights.remove(t);
+        }
+        h
+    }
+
     /// The zoom / scroll animation is still running (element rects are moving).
     pub fn animating(&self) -> bool {
         self.pps != self.target_pps || self.scroll != self.target_scroll
@@ -223,6 +278,7 @@ impl Default for TimelineView {
             split: 0.5,
             video_track_h: 60.0,
             audio_track_h: 56.0,
+            track_heights: Default::default(),
             header_w: 204.0,
             show_thumbnails: true,
             show_waveforms: true,
@@ -943,5 +999,54 @@ impl Default for UiState {
             project_panel: Default::default(),
             media_browser: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod track_height_tests {
+    use super::*;
+
+    #[test]
+    fn option_wheel_grows_and_shrinks_a_track_smoothly_within_bounds() {
+        // wheel up: taller; wheel down: shorter; the same distance back returns to the start
+        let h = wheel_track_height(56.0, 40.0, false);
+        assert!(h > 56.0 * 1.2 && h < 56.0 * 1.25, "{h}");
+        assert!((wheel_track_height(h, -40.0, false) - 56.0).abs() < 1e-3);
+        assert!(wheel_track_height(56.0, -40.0, false) < 56.0);
+        // proportional: the same notch is the same ratio on a short and a tall track
+        let r1 = wheel_track_height(30.0, 40.0, false) / 30.0;
+        let r2 = wheel_track_height(150.0, 40.0, false) / 150.0;
+        assert!((r1 - r2).abs() < 1e-4);
+        // many small trackpad steps land where one big step does (smooth, no stair-stepping)
+        let mut s = 56.0;
+        for _ in 0..40 {
+            s = wheel_track_height(s, 1.0, false);
+        }
+        assert!((s - wheel_track_height(56.0, 40.0, false)).abs() < 1e-2);
+        // fine (Cmd): a quarter of the change
+        let fine = wheel_track_height(56.0, 40.0, true);
+        assert!(fine > 56.0 && fine < h);
+        // clamped, whatever comes in
+        assert_eq!(wheel_track_height(56.0, 1e9, false), TRACK_H_MAX);
+        assert_eq!(wheel_track_height(56.0, -1e9, false), TRACK_H_MIN);
+        assert_eq!(wheel_track_height(f32::NAN, 40.0, false), wheel_track_height(TRACK_H_MIN, 40.0, false));
+        assert_eq!(wheel_track_height(56.0, f32::INFINITY, false), 56.0);
+        assert_eq!(wheel_track_height(1e9, 0.0, false), TRACK_H_MAX);
+    }
+
+    #[test]
+    fn tracks_keep_their_own_heights_until_their_kind_is_set() {
+        let mut v = TimelineView::default();
+        assert_eq!(v.track_height(5, false), v.audio_track_h);
+        assert_eq!(v.set_track_height(5, 120.0), 120.0);
+        assert_eq!(v.track_height(5, false), 120.0);
+        assert_eq!(v.track_height(6, false), v.audio_track_h, "the other tracks stay");
+        assert_eq!(v.set_track_height(5, 1e6), TRACK_H_MAX);
+        assert_eq!(v.set_track_height(5, f32::NAN), TRACK_H_MIN);
+        v.set_kind_height(false, &[5, 6], 80.0);
+        assert_eq!((v.track_height(5, false), v.track_height(6, false), v.audio_track_h), (80.0, 80.0, 80.0));
+        // a hostile stored height is still drawn within bounds
+        v.track_heights.insert(9, f32::INFINITY);
+        assert_eq!(v.track_height(9, true), TRACK_H_MIN);
     }
 }
