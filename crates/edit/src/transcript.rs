@@ -13,7 +13,9 @@
 //! Text edits turn word ranges into timeline ranges ([`word_range`]) snapped outward to frames, then
 //! reuse the ordinary [`crate::extract`] / [`crate::lift`] edits. Pause and filler-word removal
 //! ([`find_pauses`], [`find_fillers`]) produce many ranges that [`ripple_delete_ranges`] removes in
-//! one pass, right to left. Captions come from [`caption_blocks`].
+//! one pass, right to left. Every text edit goes through [`close_slivers`] first, so no cut leaves
+//! a piece of a clip two frames long or less beside a clip edge or another cut. Captions come from
+//! [`caption_blocks`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -255,12 +257,128 @@ pub fn merge_ranges(mut r: Vec<TimeRange>) -> Vec<TimeRange> {
     out
 }
 
+/// The longest piece of a clip a cut must not leave on its own: two frames (with the boundary
+/// slack of rates whose frame is not a whole number of ticks).
+pub fn sliver_max(rate: FrameRate) -> Tick {
+    Tick(rate.frame_duration().0.saturating_mul(2)) + rate.boundary_slack()
+}
+
+/// Tidy the ranges a text edit removes on `tracks` (and the sync-locked tracks) so that it leaves
+/// no sliver, a piece of a clip of at most [`sliver_max`] (a frame or two of a take that plays as
+/// a flash and a click):
+///
+/// - two cuts that close together are merged, taking the stretch between them;
+/// - a cut edge that close to a clip edge (the sequence head counts) is moved onto it.
+///
+/// Each cut edge was rounded to frames on its own (a word outward, a pause inward, a filler to the
+/// nearest frame), so the frames between two cuts, or between a cut and an edit point, were left.
+/// Only quiet stretches are taken: none holds a word that stays (one whose midpoint is outside
+/// every cut), voice that no cut touches (the voice of a word being removed may leave a frame of
+/// its onset or tail), or a clip without a transcript (it may be dialogue). Speech is never
+/// removed, so a sliver of speech stays. Returns the ranges sorted and merged.
+pub fn close_slivers(seq: &Sequence, ranges: Vec<TimeRange>, tracks: &[TrackId], transcripts: &Transcripts) -> Vec<TimeRange> {
+    let mut cuts = merge_ranges(ranges.into_iter().filter(|r| r.duration > Tick::ZERO).collect());
+    if cuts.is_empty() {
+        return cuts;
+    }
+    let max = sliver_max(seq.settings.frame_rate);
+    let words = sequence_words(seq, transcripts);
+    let voice = sequence_voice(seq, transcripts);
+    let orig = cuts.clone();
+    let in_cut = |t: Tick| {
+        let i = orig.partition_point(|c| c.end() <= t);
+        orig.get(i).is_some_and(|c| c.contains(t))
+    };
+    let touches_cut = |r: &TimeRange| {
+        let i = orig.partition_point(|c| c.end() <= r.start);
+        orig.get(i).is_some_and(|c| c.start < r.end())
+    };
+    // speech that stays: kept words and voice no cut touches
+    let mut speech: Vec<TimeRange> = words
+        .iter()
+        .filter(|w| !in_cut(Tick(w.start.0 + (w.end.0 - w.start.0) / 2)))
+        .map(|w| TimeRange::from_bounds(w.start, w.end.max(w.start + Tick(1))))
+        .collect();
+    speech.extend(voice.spans.iter().filter(|v| !touches_cut(v)).copied());
+    let speech = merge_ranges(speech);
+    let audio: Vec<TimeRange> = seq.audio_tracks.iter().flat_map(|t| t.items.iter().filter(|i| i.enabled).map(|i| i.range())).collect();
+    let quiet = |g: TimeRange| -> bool {
+        if g.duration <= Tick::ZERO {
+            return true;
+        }
+        let i = speech.partition_point(|p| p.end() <= g.start);
+        if speech.get(i).is_some_and(|p| p.start < g.end()) {
+            return false;
+        }
+        // outside the transcribed ranges only empty timeline (or picture) may go
+        subtract(g, &voice.covered).iter().all(|p| !audio.iter().any(|a| a.overlaps(p)))
+    };
+    let mut edges: Vec<Tick> = seq
+        .all_tracks()
+        .filter(|t| !t.locked && (tracks.contains(&t.id) || t.sync_lock))
+        .flat_map(|t| t.items.iter().flat_map(|i| [i.start, i.end()]))
+        .chain(std::iter::once(Tick::ZERO))
+        .collect();
+    edges.sort();
+    edges.dedup();
+    // merging and snapping only grow the cuts, by at most `max` per edge: a few rounds settle it
+    for _ in 0..4 {
+        let before = cuts.clone();
+        let mut merged: Vec<TimeRange> = Vec::with_capacity(cuts.len());
+        for c in cuts {
+            match merged.last_mut() {
+                Some(l) if c.start - l.end() <= max && quiet(TimeRange::from_bounds(l.end(), c.start)) => {
+                    *l = TimeRange::from_bounds(l.start, c.end().max(l.end()));
+                }
+                _ => merged.push(c),
+            }
+        }
+        cuts = merged;
+        for i in 0..cuts.len() {
+            let prev_end = i.checked_sub(1).and_then(|p| cuts.get(p)).map(|p| p.end());
+            let next_start = cuts.get(i + 1).map(|n| n.start);
+            let Some(c) = cuts.get(i).copied() else { break };
+            // the farthest edge in reach before the start, then after the end, over quiet only
+            let lo_t = prev_end.map_or(c.start - max, |p| p.max(c.start - max));
+            let lo = edges.partition_point(|e| *e < lo_t);
+            let start = edges
+                .get(lo..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|e| **e < c.start)
+                .find(|e| quiet(TimeRange::from_bounds(**e, c.start)))
+                .copied()
+                .unwrap_or(c.start);
+            let hi_t = next_start.map_or(c.end() + max, |n| n.min(c.end() + max));
+            let hi = edges.partition_point(|e| *e <= hi_t);
+            let end = edges
+                .get(..hi)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .take_while(|e| **e > c.end())
+                .find(|e| quiet(TimeRange::from_bounds(c.end(), **e)))
+                .copied()
+                .unwrap_or(c.end());
+            if let Some(slot) = cuts.get_mut(i) {
+                *slot = TimeRange::from_bounds(start.max(Tick::ZERO), end);
+            }
+        }
+        cuts = merge_ranges(cuts);
+        if cuts == before {
+            break;
+        }
+    }
+    cuts
+}
+
 /// Ripple-delete every range on every unlocked track (and sync-locked caption tracks), right to
-/// left so earlier ranges keep their positions. Returns the total time removed.
-pub fn ripple_delete_ranges(seq: &mut Sequence, ranges: Vec<TimeRange>, ctx: &mut EditCtx) -> Tick {
+/// left so earlier ranges keep their positions, leaving no sliver ([`close_slivers`]). Returns the
+/// total time removed.
+pub fn ripple_delete_ranges(seq: &mut Sequence, ranges: Vec<TimeRange>, transcripts: &Transcripts, ctx: &mut EditCtx) -> Tick {
     let tracks: Vec<TrackId> = seq.all_tracks().filter(|t| !t.locked).map(|t| t.id).collect();
     let mut total = Tick::ZERO;
-    for r in merge_ranges(ranges).into_iter().rev() {
+    for r in close_slivers(seq, ranges, &tracks, transcripts).into_iter().rev() {
         if r.duration <= Tick::ZERO {
             continue;
         }
@@ -270,11 +388,12 @@ pub fn ripple_delete_ranges(seq: &mut Sequence, ranges: Vec<TimeRange>, ctx: &mu
     total
 }
 
-/// Lift every range on every unlocked track, leaving gaps (Delete with Lift chosen).
-pub fn lift_ranges(seq: &mut Sequence, ranges: Vec<TimeRange>, ctx: &mut EditCtx) -> Tick {
+/// Lift every range on every unlocked track, leaving gaps (Delete with Lift chosen) and no sliver
+/// ([`close_slivers`]).
+pub fn lift_ranges(seq: &mut Sequence, ranges: Vec<TimeRange>, transcripts: &Transcripts, ctx: &mut EditCtx) -> Tick {
     let tracks: Vec<TrackId> = seq.all_tracks().filter(|t| !t.locked).map(|t| t.id).collect();
     let mut total = Tick::ZERO;
-    for r in merge_ranges(ranges) {
+    for r in close_slivers(seq, ranges, &tracks, transcripts) {
         if r.duration <= Tick::ZERO {
             continue;
         }

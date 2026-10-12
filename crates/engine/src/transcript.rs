@@ -614,6 +614,8 @@ fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
     let cmd = if extract { "transcript.extract" } else { "transcript.lift" };
     let r = range_p(s, p, cmd)?;
     let tg = s.targeting().targeted;
+    // no sliver of a clip left at the sequence head, an edit point or a cut made before
+    let r = s.active_sequence().and_then(|q| tx::close_slivers(q, vec![r], &tg, &s.project.transcripts).first().copied()).unwrap_or(r);
     s.edit_sequence(if extract { "Extract Text" } else { "Lift Text" }, |q, ctx, _| {
         if extract {
             edit::extract(q, &tg, r, ctx);
@@ -857,7 +859,9 @@ fn delete_hits(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let n = ranges.len();
     let label = format!("{} {what}", if lift { "Lift" } else { "Delete" });
-    let total = s.edit_sequence(&label, |q, ctx, _| Ok(if lift { tx::lift_ranges(q, ranges, ctx) } else { tx::ripple_delete_ranges(q, ranges, ctx) }))?;
+    let trs = s.project.transcripts.clone();
+    let total =
+        s.edit_sequence(&label, |q, ctx, _| Ok(if lift { tx::lift_ranges(q, ranges, &trs, ctx) } else { tx::ripple_delete_ranges(q, ranges, &trs, ctx) }))?;
     Ok(json!({"removed": n, "ticks": total.0, "seconds": total.0 as f64 / TICKS_PER_SECOND as f64, "mode": if lift { "lift" } else { "extract" }}))
 }
 
@@ -866,7 +870,8 @@ fn remove_ranges(s: &mut Session, label: &str, ranges: Vec<TimeRange>) -> Result
     if n == 0 {
         return Ok(json!({"removed": 0, "ticks": 0}));
     }
-    let total = s.edit_sequence(label, |q, ctx, _| Ok(tx::ripple_delete_ranges(q, ranges, ctx)))?;
+    let trs = s.project.transcripts.clone();
+    let total = s.edit_sequence(label, |q, ctx, _| Ok(tx::ripple_delete_ranges(q, ranges, &trs, ctx)))?;
     Ok(json!({"removed": n, "ticks": total.0, "seconds": total.0 as f64 / TICKS_PER_SECOND as f64}))
 }
 

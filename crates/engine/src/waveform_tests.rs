@@ -239,3 +239,107 @@ fn a_tight_cut_keeps_the_original_noise_floor_as_the_ruler() {
     // what is left at each cut is the 30 + 35 ms margins, rounded to whole 40 ms frames
     assert!(r["runs"].as_array().unwrap().iter().all(|x| x["ms"].as_f64().unwrap() <= 110.0), "{r}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Slivers: text edits never leave a 1–2-frame piece of a clip at a seam
+// ---------------------------------------------------------------------------------------------
+
+fn sec(x: f64) -> Tick {
+    Tick::from_seconds_f64(x)
+}
+
+/// The fixture's media as `takes` (timeline start, media In, media Out) on A1 of the 25 fps
+/// sequence, transcribed as `words` (media seconds) with their spans as the voice map.
+fn takes_session(takes: &[(f64, f64, f64)], words: &[(&str, f64, f64)]) -> Session {
+    let (mut s, item) = session();
+    let rate = FrameRate::new(25, 1);
+    let seq = s.state.active_sequence.unwrap();
+    let mut p = (*s.project).clone();
+    let items: Vec<_> =
+        takes.iter().map(|(at, a, b)| p.make_track_item(item, TrackKind::Audio, sec(*at), TimeRange::from_bounds(sec(*a), sec(*b)), rate).unwrap()).collect();
+    p.sequence_mut(seq).unwrap().audio_tracks[0].items = items;
+    s.project = Arc::new(p);
+    let w: Vec<Value> = words.iter().map(|(t, a, b)| json!({"text": t, "start": sec(*a).0, "end": sec(*b).0, "confidence": 1.0})).collect();
+    let v: Vec<Value> = words.iter().map(|(_, a, b)| json!([sec(*a).0, sec(*b).0])).collect();
+    s.execute("transcript.set", json!({"item": item.0, "transcript": {"language": "en", "words": w, "voice": v}})).unwrap();
+    s.active_sequence().unwrap().check().unwrap();
+    s
+}
+
+/// Every clip on every track is at least three frames long, and `waveform.joins` finds no cut
+/// through a word and no voice running across a cut.
+fn assert_no_slivers(s: &mut Session) {
+    let q = s.active_sequence().unwrap();
+    let fd = q.settings.frame_rate.frame_duration();
+    for t in q.all_tracks() {
+        for i in &t.items {
+            assert!(i.duration >= Tick(fd.0 * 3), "a {}-frame sliver at {:.3} s: {:?}", i.duration.0 as f64 / fd.0 as f64, i.start.seconds(), t.items);
+        }
+    }
+    let r = s.execute("waveform.joins", json!({"tighten": false})).unwrap();
+    assert!(!issues(&r).iter().any(|i| i.starts_with("clipsWord") || i.starts_with("voiceRuns")), "{r}");
+}
+
+fn word_texts(s: &mut Session) -> Vec<String> {
+    let r = s.execute("transcript.inspect", json!({})).unwrap();
+    r["words"].as_array().unwrap().iter().map(|w| w["text"].as_str().unwrap().to_string()).collect()
+}
+
+const THREE: [(&str, f64, f64); 3] = [("alpha", 0.40, 1.00), ("bravo", 1.80, 2.40), ("charlie", 3.00, 3.60)];
+
+/// Live 2026-10-12: the lead-in pause deleted (keeping 35 ms before the first word), then the
+/// first word extracted: the cut started on the frame the word starts in and left the frame
+/// before it, 40 ms of silence, as a clip of its own at the sequence head.
+#[test]
+fn extracting_the_first_words_leaves_no_sliver_at_the_head() {
+    let mut s = takes_session(&[(0.0, 0.0, 4.2)], &THREE);
+    let r = s.execute("transcript.deleteHits", json!({"filter": "pauses", "hit": 0})).unwrap();
+    assert!(near(&r["seconds"], 0.36, 0.001), "the lead-in less the 35 ms margin, down to frames: {r}");
+    let r = s.execute("transcript.extract", json!({"from": 0})).unwrap();
+    assert_eq!(r["start"], 0, "the cut runs from the sequence head: {r}");
+    assert_eq!(word_texts(&mut s), ["bravo", "charlie"]);
+    assert_no_slivers(&mut s);
+}
+
+/// Live 2026-10-12: take 1.1 appended after take 1.0, each trimmed a couple of frames from its
+/// words. Extracting the first word of 1.1 left 1.1's two frames of lead-in before the cut, and
+/// extracting the last word of 1.0 left 1.0's two frames of tail after it.
+#[test]
+fn extracting_words_at_a_clip_boundary_leaves_no_sliver() {
+    // take 1.0 ends 80 ms after "alpha"; take 1.1 starts 80 ms before "bravo"
+    let mut s = takes_session(&[(0.0, 0.0, 1.08), (1.08, 1.72, 4.2)], &THREE);
+    let r = s.execute("transcript.extract", json!({"from": 1})).unwrap();
+    assert_eq!(r["start"].as_i64().unwrap(), sec(1.08).0, "snapped back to the take's In point: {r}");
+    assert_no_slivers(&mut s);
+    let r = s.execute("transcript.extract", json!({"from": 0})).unwrap();
+    assert_eq!(r["end"].as_i64().unwrap(), sec(1.08).0, "snapped on to the take's Out point: {r}");
+    assert_eq!(word_texts(&mut s), ["charlie"]);
+    assert_no_slivers(&mut s);
+    // nothing of the words around the cuts went: the lead-in and "charlie" are whole
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.duration(), sec(3.56 - 1.36), "two 0.68 s cuts from 1.08 + 2.48 s of takes");
+}
+
+/// Live 2026-10-12 ("about | What"): two fillers 40 ms apart each rounded to their nearest frames
+/// left the frame between the cuts, the end of "um", as a 1-frame clip (an audible blip).
+#[test]
+fn adjacent_cuts_leave_no_sliver_between_them() {
+    let words = [("about", 0.40, 0.90), ("um", 1.00, 1.30), ("uh", 1.34, 1.60), ("What", 1.80, 2.40), ("now", 3.00, 3.60)];
+    let mut s = takes_session(&[(0.0, 0.0, 4.2)], &words);
+    let before = s.active_sequence().unwrap().duration();
+    let r = s.execute("transcript.deleteHits", json!({"filter": "fillers"})).unwrap();
+    assert_eq!(r["removed"], 2, "{r}");
+    assert_eq!(word_texts(&mut s), ["about", "What", "now"]);
+    assert_eq!(s.active_sequence().unwrap().duration(), before - sec(0.60), "1.00–1.60 in one cut");
+    assert_no_slivers(&mut s);
+}
+
+/// Speech between two cuts stays, however short: a word, or voice with no word on it.
+#[test]
+fn speech_between_close_cuts_is_never_removed() {
+    // "a" (40 ms) sits between the two fillers
+    let words = [("about", 0.40, 0.90), ("um", 1.00, 1.28), ("a", 1.29, 1.33), ("uh", 1.34, 1.60), ("What", 1.80, 2.40)];
+    let mut s = takes_session(&[(0.0, 0.0, 4.2)], &words);
+    s.execute("transcript.deleteHits", json!({"filter": "fillers"})).unwrap();
+    assert_eq!(word_texts(&mut s), ["about", "a", "What"]);
+}

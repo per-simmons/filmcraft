@@ -193,7 +193,7 @@ fn pauses_are_found_and_removed_in_one_pass() {
     assert_eq!(p2.len(), 3);
     let mut next = 1000;
     let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
-    let removed = ripple_delete_ranges(&mut q, p2.clone(), &mut ctx);
+    let removed = ripple_delete_ranges(&mut q, p2.clone(), &transcripts(), &mut ctx);
     q.check().unwrap();
     assert_eq!(removed, p2.iter().map(|r| r.duration).fold(Tick::ZERO, |a, b| a + b));
     let w2 = sequence_words(&q, &transcripts());
@@ -220,7 +220,7 @@ fn fillers_are_found_with_phrases_and_removed() {
     assert_eq!(ranges.iter().map(|r| (r.start, r.end())).collect::<Vec<_>>(), vec![(s(3.68), s(4.00)), (s(8.20), s(8.48))]);
     let mut next = 1000;
     let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
-    ripple_delete_ranges(&mut q, ranges, &mut ctx);
+    ripple_delete_ranges(&mut q, ranges, &transcripts(), &mut ctx);
     q.check().unwrap();
     let w2 = sequence_words(&q, &transcripts());
     assert_eq!(w2.len(), 18);
@@ -460,13 +460,13 @@ fn lift_leaves_the_gaps_extract_closes_them() {
     let mut next = 1000;
     let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
     let mut lifted = q.clone();
-    assert_eq!(lift_ranges(&mut lifted, cuts.clone(), &mut ctx), total);
+    assert_eq!(lift_ranges(&mut lifted, cuts.clone(), &m, &mut ctx), total);
     lifted.check().unwrap();
     // lifting leaves every word where it was (only the tail after the last voice is gone)
     let lw = sequence_words(&lifted, &m);
     assert_eq!(lw.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(), w.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>());
     let mut extracted = q.clone();
-    assert_eq!(ripple_delete_ranges(&mut extracted, cuts, &mut ctx), total);
+    assert_eq!(ripple_delete_ranges(&mut extracted, cuts, &m, &mut ctx), total);
     extracted.check().unwrap();
     assert_eq!(extracted.duration(), q.duration() - total);
     // the words all survive, closer together
@@ -498,4 +498,40 @@ fn pauses_of_an_hour_long_transcript_are_found_quickly() {
     let _ = layout(&w, &p, &sp);
     assert_eq!(p.len(), n, "a pause after every word (the last one is the tail)");
     assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{:?}", t0.elapsed());
+}
+
+#[test]
+fn close_slivers_takes_only_quiet_frames() {
+    let r = |a: f64, b: f64| TimeRange::from_bounds(s(a), s(b));
+    // "so but then" on 0–3 s, an untranscribed clip on 3–6 s
+    let (mut q, m) = voiced_seq(vec![clip(1, 0.0, 3.0, 0.0)]);
+    let mut other = clip(2, 3.0, 3.0, 0.0);
+    other.item = ItemId(99);
+    q.audio_tracks[0].items.push(other);
+    let tracks: Vec<TrackId> = q.all_tracks().map(|t| t.id).collect();
+    // a frame of silence before the clip edge goes; a frame of the untranscribed clip after it
+    // (maybe dialogue) stays, and so does the frame between the two cuts that is in it
+    assert_eq!(close_slivers(&q, vec![r(2.6, 2.96), r(3.04, 3.5)], &tracks, &m), vec![r(2.6, 3.0), r(3.04, 3.5)]);
+    // the head of the sequence is an edge too, but not over a word: "so" starts at 0.5
+    assert_eq!(close_slivers(&q, vec![r(0.04, 0.3)], &tracks, &m), vec![r(0.0, 0.3)]);
+    assert_eq!(close_slivers(&q, vec![r(0.52, 0.8)], &tracks, &m), vec![r(0.52, 0.8)]);
+    // two frames of silence between cuts go; a word or wordless voice there stays
+    assert_eq!(close_slivers(&q, vec![r(1.36, 1.6), r(1.64, 1.68)], &tracks, &m), vec![r(1.36, 1.68)]);
+    let w = |t: &str, a: f64, b: f64| filmcraft_project::Word::new(t, s(a), s(b));
+    let mut short = Transcript {
+        language: "en".into(),
+        words: vec![w("a", 0.5, 0.8), w("c", 1.30, 1.33), w("b", 1.5, 1.8)],
+        voice: vec![(s(0.5), s(0.8)), (s(1.10), s(1.12)), (s(1.30), s(1.33)), (s(1.5), s(1.8))],
+        ..Default::default()
+    };
+    short.normalize();
+    let mut m2 = Transcripts::new();
+    m2.insert(VOICED, Arc::new(short));
+    // the 20 ms blip at 1.10 and the 30 ms word "c" each sit in a 2-frame gap
+    let keep = vec![r(0.84, 1.08), r(1.16, 1.28), r(1.36, 1.44)];
+    assert_eq!(close_slivers(&q, keep.clone(), &tracks, &m2), keep);
+    // three frames are not a sliver
+    assert_eq!(close_slivers(&q, vec![r(1.36, 1.44), r(1.56, 1.6)], &tracks, &m), vec![r(1.36, 1.44), r(1.56, 1.6)]);
+    // without a transcript nothing is known to be quiet
+    assert_eq!(close_slivers(&q, vec![r(1.36, 1.6), r(1.64, 1.68)], &tracks, &Transcripts::new()), vec![r(1.36, 1.6), r(1.64, 1.68)]);
 }
