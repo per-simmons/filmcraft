@@ -309,3 +309,18 @@ fn find_pauses_measures_imported_transcripts() {
     assert_eq!(s.project.transcripts[&item].words.len(), 1, "an imported transcript keeps its words as they are");
     assert_eq!(crate::transcript::view(&s, None).without_voice, 0);
 }
+
+#[test]
+fn transcribing_a_selected_sequence_transcribes_its_media() {
+    // After Duplicate the copy stays selected in the Project panel; Transcribe used to take that
+    // sequence for the thing to transcribe and found nothing ("nothing to transcribe").
+    let (mut s, item, _) = session();
+    let seq = s.state.active_sequence.unwrap();
+    s.execute("project.select", json!({"items": [seq.0]})).unwrap();
+    let copy = s.execute("edit.duplicate", json!({})).unwrap()["items"][0].as_u64().unwrap();
+    assert_eq!(s.state.project_selection, vec![ItemId(copy)], "the copy is selected");
+    s.execute("sequence.open", json!({"item": copy})).unwrap();
+    let r = s.execute("transcript.generate", json!({})).unwrap();
+    assert_eq!(r["items"][0]["item"], json!(item.0), "the sequence's audio media: {r}");
+    assert_eq!(s.project.transcripts[&item].words.len(), 6);
+}

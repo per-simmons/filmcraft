@@ -118,8 +118,16 @@ fn ids_p(p: &Value, k: &str) -> Option<Vec<ItemId>> {
     p.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(ItemId).collect())
 }
 
+/// The media of a sequence's enabled audio clips.
+fn sequence_media(q: &filmcraft_project::Sequence) -> Vec<ItemId> {
+    q.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|it| it.enabled).map(|it| it.item).collect()
+}
+
 /// Items to transcribe: `items` / `item`, else the Project panel selection, else the media of the
-/// active sequence's enabled audio clips. Subclips resolve to their media; duplicates are removed.
+/// active sequence's enabled audio clips. A sequence among them stands for the media of its audio
+/// clips (as in Premiere, transcribing a selected sequence transcribes what's in it: after
+/// Duplicate the copy stays selected, and that found nothing to transcribe). Subclips resolve to
+/// their media; duplicates are removed.
 fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
     let mut raw = ids_p(p, "items").or_else(|| u64_p(p, "item").map(|i| vec![ItemId(i)])).unwrap_or_default();
     if raw.is_empty() {
@@ -128,8 +136,15 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
     if raw.is_empty()
         && let Some(q) = s.active_sequence()
     {
-        raw = q.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|it| it.enabled).map(|it| it.item).collect();
+        raw = sequence_media(q);
     }
+    let raw: Vec<ItemId> = raw
+        .into_iter()
+        .flat_map(|i| match s.project.item(i).and_then(|it| it.as_sequence()) {
+            Some(q) => sequence_media(q),
+            None => vec![i],
+        })
+        .collect();
     let mut out = Vec::new();
     for i in raw {
         if let Some(m) = media_item(s, i)
