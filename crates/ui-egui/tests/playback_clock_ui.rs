@@ -124,12 +124,14 @@ fn up_and_down_jump_to_edits_while_playing_and_keep_playing() {
     assert!(p2 > p1 && p2.seconds() - e1.seconds() < 0.6, "playback carried on from the edit: {:.3} s", p2.seconds());
     assert!(h.state().playback.playing);
 
-    // Up: back to the edit before, still playing
+    // Up: back to the edit before, still playing. The cut just played over (`e1`, a few frames
+    // behind the playhead) is passed over, as in Premiere: Up goes to the one before it.
     let prev_before = |t: Tick| edits.iter().copied().filter(|e| *e < t).max();
     let p3 = h.state().session.playhead();
+    assert_eq!(prev_before(p3), Some(e1));
     press(&mut h, egui::Key::ArrowUp, true);
     let p4 = h.state().session.playhead();
-    let e0 = prev_before(p3).unwrap_or(Tick::ZERO);
+    let e0 = prev_before(e1).unwrap_or(Tick::ZERO);
     assert!(near(p4, e0), "Shift+Up from {:.3} s went to {:.3} s, the edit before is {:.3} s", p3.seconds(), p4.seconds(), e0.seconds());
     assert!(h.state().playback.playing);
 
@@ -140,4 +142,168 @@ fn up_and_down_jump_to_edits_while_playing_and_keep_playing() {
     assert!(p6.seconds() > p5.seconds() + 0.1 && edits.iter().any(|e| near(p6, *e)), "Down while playing: {:.3} → {:.3} s", p5.seconds(), p6.seconds());
     assert!(h.state().playback.playing);
     h.state_mut().stop();
+}
+
+/// Premiere: Up pressed again and again while playing steps back cut by cut. Each press used to
+/// land on the cut just behind the playhead, which after the first press is the cut it had just
+/// gone to (playback carries the playhead a few frames past it before the next press).
+#[test]
+fn up_repeated_while_playing_steps_back_cut_by_cut() {
+    for shift in [false, true] {
+        let mut s = Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let rate = s.sequence_rate();
+        // plain Up follows the targeted tracks: target V1 only
+        let v1 = s.active_sequence().unwrap().video_tracks[0].id;
+        for t in s.targeting().targeted {
+            s.execute("timeline.setTargeting", json!({"track": t.0, "targeted": t == v1})).unwrap();
+        }
+        s.execute("timeline.setTargeting", json!({"track": v1.0, "targeted": true})).unwrap();
+        let seq = s.active_sequence().unwrap();
+        let mut edits: Vec<Tick> = if shift { seq.edit_points() } else { seq.video_tracks[0].items.iter().flat_map(|i| [i.start, i.end()]).collect() };
+        edits = edits.into_iter().map(|e| rate.snap_edit(e)).collect();
+        edits.sort();
+        edits.dedup();
+        assert!(edits.len() >= 4, "{edits:?}");
+        let (c1, c2, c3) = (edits[0], edits[1], edits[2]);
+        // mid-clip in clip 3
+        s.set_playhead(Tick((c3.0 + edits[3].0) / 2));
+        let mut app = FilmcraftApp::new(s);
+        app.audio = Some(Box::new(FakeOut { played: Arc::new(AtomicU64::new(0)), per_poll: 1_200, started: false }));
+        let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_step_dt(0.025).build_eframe(move |_cc| app);
+        frame(&mut h);
+        h.state_mut().play(1.0);
+        let start = h.state().session.playhead();
+        for _ in 0..400 {
+            frame(&mut h);
+            if h.state().session.playhead() > start {
+                break;
+            }
+        }
+        assert!(h.state().playback.playing && h.state().session.playhead() < edits[3], "playing in clip 3");
+        for want in [c3, c2, c1] {
+            press(&mut h, egui::Key::ArrowUp, shift);
+            let got = h.state().session.playhead();
+            assert_eq!(got, want, "Up (shift {shift}) went to {:.3} s, want {:.3} s", got.seconds(), want.seconds());
+            assert!(h.state().playback.playing, "still playing");
+            // playback carries on a few frames from the cut before the next press
+            for _ in 0..4 {
+                frame(&mut h);
+            }
+            let on = h.state().session.playhead();
+            assert!(on > want && on.seconds() - want.seconds() < 0.5, "played on from the cut: {:.3} s", on.seconds());
+        }
+        assert!(h.state().playback.playing);
+        h.state_mut().stop();
+    }
+}
+
+/// A demo-project app in a harness with a working audio output, `return_to_beginning` as given.
+fn demo_app(return_to_beginning: bool) -> Harness<'static, FilmcraftApp> {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.prefs.timeline.return_to_beginning = return_to_beginning;
+    let mut app = FilmcraftApp::new(s);
+    app.audio = Some(Box::new(FakeOut { played: Arc::new(AtomicU64::new(0)), per_poll: 1_200, started: false }));
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_step_dt(0.025).build_eframe(move |_cc| app);
+    frame(&mut h);
+    h
+}
+
+/// Premiere: no wrapping at the ends of the timeline while playing. Down past the last edit goes
+/// to the sequence end, where playback stops (it does not start again from the beginning); Up at
+/// the start stays at the start and plays on from there.
+#[test]
+fn edit_keys_while_playing_do_not_wrap_at_the_ends() {
+    for shift in [false, true] {
+        let mut h = demo_app(false);
+        let end = {
+            let s = &h.state().session;
+            s.sequence_rate().snap_edit(s.active_sequence().unwrap().duration())
+        };
+        h.state_mut().session.set_playhead(Tick::ZERO);
+        h.state_mut().play(1.0);
+        for _ in 0..400 {
+            frame(&mut h);
+            if h.state().session.playhead() > Tick::ZERO {
+                break;
+            }
+        }
+        // Down until playback reaches the end: always forward, ends at the sequence end, stopped
+        let mut last = h.state().session.playhead();
+        for _ in 0..60 {
+            press(&mut h, egui::Key::ArrowDown, shift);
+            frame(&mut h);
+            let t = h.state().session.playhead();
+            assert!(t >= last, "Down (shift {shift}) went back from {:.3} s to {:.3} s", last.seconds(), t.seconds());
+            last = t;
+        }
+        assert_eq!(h.state().session.playhead(), end, "Down (shift {shift}) ends at the sequence end");
+        assert!(!h.state().playback.playing, "playback stopped at the end");
+        for _ in 0..20 {
+            frame(&mut h);
+        }
+        assert_eq!(h.state().session.playhead(), end, "and stays there");
+
+        // Up from the start while playing: stays at the start (never jumps to the end), plays on
+        h.state_mut().session.set_playhead(Tick::ZERO);
+        h.state_mut().play(1.0);
+        for _ in 0..400 {
+            frame(&mut h);
+            if h.state().session.playhead() > Tick::ZERO {
+                break;
+            }
+        }
+        for _ in 0..5 {
+            press(&mut h, egui::Key::ArrowUp, shift);
+            assert_eq!(h.state().session.playhead(), Tick::ZERO, "Up (shift {shift}) near the start goes to the start");
+            frame(&mut h);
+            assert!(h.state().session.playhead().seconds() < 0.5, "playing on from the start");
+        }
+        assert!(h.state().playback.playing);
+        h.state_mut().stop();
+    }
+}
+
+/// Playback that reaches the end of the sequence stops on its last edge, with Loop off. The
+/// "return to beginning" preference only matters when playback is started again from there: off,
+/// it plays nothing and stays; on, it starts from the beginning (Premiere).
+#[test]
+fn playback_stops_at_the_sequence_end_without_wrapping() {
+    for rtb in [false, true] {
+        let mut h = demo_app(rtb);
+        let (end, near_end) = {
+            let s = &h.state().session;
+            let rate = s.sequence_rate();
+            let end = rate.snap_edit(s.active_sequence().unwrap().duration());
+            (end, Tick(end.0.saturating_sub(rate.tick_of(6).0)))
+        };
+        assert!(!h.state().playback.looping);
+        h.state_mut().session.set_playhead(near_end);
+        h.state_mut().play(1.0);
+        for _ in 0..400 {
+            frame(&mut h);
+            if !h.state().playback.playing {
+                break;
+            }
+        }
+        assert!(!h.state().playback.playing, "stopped at the end (return to beginning {rtb})");
+        for _ in 0..20 {
+            frame(&mut h);
+        }
+        assert_eq!(h.state().session.playhead(), end, "stays on the end, never wraps to 0 (return to beginning {rtb})");
+        // play again from the end
+        h.state_mut().play(1.0);
+        for _ in 0..40 {
+            frame(&mut h);
+        }
+        let t = h.state().session.playhead();
+        if rtb {
+            assert!(t < end && t.seconds() < 2.0, "restarts from the beginning: {:.3} s", t.seconds());
+        } else {
+            assert_eq!(t, end, "return to beginning off: stays at the end");
+            assert!(!h.state().playback.playing);
+        }
+        h.state_mut().stop();
+    }
 }

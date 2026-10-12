@@ -105,6 +105,113 @@ fn edit_point_navigation_follows_targets_or_any_track() {
     assert_eq!(s.playhead(), all[1]);
 }
 
+/// Premiere: Up pressed again and again while playing steps back cut by cut. Playback carries
+/// the playhead a few frames past the cut the last press went to, and FilmCraft found that same
+/// cut again on every press.
+#[test]
+fn previous_edit_while_playing_steps_back_cut_by_cut() {
+    for (cmd, any) in [("playhead.prevEdit", false), ("playhead.prevEditAnyTrack", true)] {
+        let mut s = demo();
+        target_v1(&mut s);
+        let rate = s.sequence_rate();
+        let mut edits: Vec<Tick> =
+            if any { s.active_sequence().unwrap().edit_points() } else { items(&s, TrackKind::Video, 0).iter().flat_map(|c| [c.1, c.2]).collect() };
+        edits = edits.into_iter().map(|e| rate.snap_edit(e)).collect();
+        edits.sort();
+        edits.dedup();
+        assert!(edits.len() >= 3, "{edits:?}");
+        let (c1, c2, c3) = (edits[0], edits[1], edits[2]);
+        let end3 = edits.get(3).copied().unwrap_or(c3 + rate.tick_of(48));
+        s.playing = true;
+        // mid-clip in clip 3
+        s.set_playhead(Tick((c3.0 + end3.0) / 2));
+        s.execute(cmd, json!({})).unwrap();
+        assert_eq!(s.playhead(), c3, "{cmd}: first press, the start of the clip under the playhead");
+        for want in [c2, c1] {
+            // playback moves on a few frames before the next press
+            let t = s.playhead();
+            s.set_playhead(t + rate.tick_of(4));
+            s.execute(cmd, json!({})).unwrap();
+            assert_eq!(s.playhead(), want, "{cmd}: the cut before, not the one just played over");
+            assert!(s.playing);
+        }
+        // at the first edit there is nothing before it: it stays there
+        let t = s.playhead();
+        s.set_playhead(t + rate.tick_of(4));
+        s.execute(cmd, json!({})).unwrap();
+        assert_eq!(s.playhead(), c1);
+
+        // paused, a few frames past a cut, Up goes back to that cut (Premiere)
+        s.playing = false;
+        s.set_playhead(c3 + rate.tick_of(4));
+        s.execute(cmd, json!({})).unwrap();
+        assert_eq!(s.playhead(), c3, "{cmd} paused");
+        // playing well past the cut (more than the grace period): the start of this clip
+        s.playing = true;
+        let late = c3 + Tick::from_seconds_f64(keyboard::PREV_EDIT_REPEAT_S + 0.1);
+        if late < end3 {
+            s.set_playhead(late);
+            s.execute(cmd, json!({})).unwrap();
+            assert_eq!(s.playhead(), c3, "{cmd}: long after the cut");
+        }
+        // Down while playing still walks forward one cut at a time
+        s.set_playhead(c1 + rate.tick_of(4));
+        s.execute(if any { "playhead.nextEditAnyTrack" } else { "playhead.nextEdit" }, json!({})).unwrap();
+        assert_eq!(s.playhead(), c2);
+        let t = s.playhead();
+        s.set_playhead(t + rate.tick_of(4));
+        s.execute(if any { "playhead.nextEditAnyTrack" } else { "playhead.nextEdit" }, json!({})).unwrap();
+        assert_eq!(s.playhead(), c3);
+    }
+}
+
+/// Premiere: edit-point navigation stops at the ends of the timeline. Up at (or before) the first
+/// edit goes to the sequence start and stays there; Down at (or after) the last edit goes to the
+/// sequence end and stays there. Neither wraps around, playing or paused.
+#[test]
+fn edit_point_navigation_does_not_wrap_at_the_ends() {
+    for (playing, any) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (prev, next) = if any { ("playhead.prevEditAnyTrack", "playhead.nextEditAnyTrack") } else { ("playhead.prevEdit", "playhead.nextEdit") };
+        let mut s = demo();
+        target_v1(&mut s);
+        s.playing = playing;
+        let rate = s.sequence_rate();
+        let end = rate.snap_edit(s.active_sequence().unwrap().duration());
+        let tag = format!("playing {playing}, any track {any}");
+        // Down all the way: every press moves forward until the end, then stays there
+        s.set_playhead(Tick::ZERO);
+        let mut last = s.playhead();
+        for _ in 0..200 {
+            s.execute(next, json!({})).unwrap();
+            assert!(s.playhead() >= last, "{tag}: Down went back from {last:?} to {:?}", s.playhead());
+            last = s.playhead();
+        }
+        assert_eq!(s.playhead(), end, "{tag}: Down ends at the sequence end");
+        // Up all the way (as playback would, a few frames on between presses): back to the start
+        for _ in 0..200 {
+            if playing && s.playhead() < end {
+                let t = s.playhead();
+                s.set_playhead(t + rate.tick_of(2));
+            }
+            let before = s.playhead();
+            s.execute(prev, json!({})).unwrap();
+            assert!(s.playhead() <= before, "{tag}: Up went forward from {before:?} to {:?}", s.playhead());
+        }
+        assert!(s.playhead() <= rate.tick_of(2), "{tag}: Up ends at the start, at {:?}", s.playhead());
+        s.set_playhead(Tick::ZERO);
+        s.execute(prev, json!({})).unwrap();
+        assert_eq!(s.playhead(), Tick::ZERO, "{tag}: Up at the start stays at the start");
+        // just after the start, Up goes to the start (never on to the end)
+        s.set_playhead(rate.tick_of(3));
+        s.execute(prev, json!({})).unwrap();
+        assert_eq!(s.playhead(), Tick::ZERO, "{tag}: Up near the start");
+        // at the end, Down stays at the end (never back to the start)
+        s.set_playhead(end);
+        s.execute(next, json!({})).unwrap();
+        assert_eq!(s.playhead(), end, "{tag}: Down at the end stays at the end");
+    }
+}
+
 #[test]
 fn select_clip_at_playhead_next_previous_and_go_to_selected_clip() {
     let mut s = demo();

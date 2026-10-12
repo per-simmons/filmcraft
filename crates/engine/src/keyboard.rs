@@ -68,22 +68,53 @@ fn edits_on(seq: &Sequence, tracks: Option<&[TrackId]>) -> Vec<Tick> {
     v
 }
 
+/// While playing, Go to Previous Edit Point passes over a cut the playhead crossed less than this
+/// long ago (s): by the time a key is pressed again, playback has carried the playhead a few
+/// frames past the cut the last press landed on (Premiere steps back cut by cut).
+pub const PREV_EDIT_GRACE_S: f64 = 0.5;
+/// … and over the cut the last Go to Previous Edit Point landed on for this long (s), so presses
+/// a little slower than key repeat still step back.
+pub const PREV_EDIT_REPEAT_S: f64 = 1.0;
+
 /// Go to the next / previous edit point: on the targeted tracks (`any` = false; all tracks when
-/// none is targeted) or on any track.
+/// none is targeted) or on any track. The sequence start and end count as edit points, and
+/// neither direction wraps around: Up at the start stays there, Down at the end stays there.
 pub fn go_to_edit(s: &mut Session, next: bool, any: bool) -> Result<Value> {
     let t = s.playhead();
     let rate = s.sequence_rate();
     let tg = s.targeting().targeted;
+    let seq_id = s.state.active_sequence;
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let only = (!any && !tg.is_empty()).then_some(tg.as_slice());
     // each edit where the playhead parks for it: the first frame after the cut (a cut stored a
     // tick before a frame boundary is on it, not a frame earlier on the outgoing clip)
+    let end = rate.snap_edit(seq.duration());
     let mut edits: Vec<Tick> = edits_on(seq, only).into_iter().map(|e| rate.snap_edit(e)).collect();
+    edits.push(Tick::ZERO);
+    edits.push(end);
+    edits.sort();
     edits.dedup();
-    let e = if next { edits.into_iter().find(|e| *e > t) } else { edits.into_iter().rev().find(|e| *e < t) };
+    let e = if next {
+        edits.into_iter().find(|e| *e > t)
+    } else {
+        // Playing: the cut just behind the playhead is (almost always) the one the last press
+        // went to, so go on to the one before it. Paused, the playhead sits on that cut already.
+        let last = s.prev_edit_target.filter(|(q, _)| Some(*q) == seq_id).map(|(_, e)| e);
+        let grace = Tick::from_seconds_f64(PREV_EDIT_GRACE_S);
+        let repeat = Tick::from_seconds_f64(PREV_EDIT_REPEAT_S);
+        let recent = |e: Tick| {
+            let since = Tick(t.0.saturating_sub(e.0));
+            s.playing && (since <= grace || (Some(e) == last && since <= repeat))
+        };
+        let mut before = edits.into_iter().rev().filter(|e| *e < t).peekable();
+        let nearest = before.peek().copied();
+        // nothing before the passed-over cut (the first edit): go to that cut
+        before.find(|e| !recent(*e)).or(nearest)
+    };
     if let Some(e) = e {
         s.set_playhead(e);
     }
+    s.prev_edit_target = if next { None } else { seq_id.zip(e) };
     Ok(json!({"time": s.playhead().0}))
 }
 
