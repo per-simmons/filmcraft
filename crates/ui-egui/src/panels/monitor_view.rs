@@ -567,15 +567,13 @@ pub fn waveform(
     match crate::panels::timeline::request_peaks(app, item) {
         Some(peaks) if !peaks.is_empty() => {
             let half = area.height() * 0.45;
-            let spp = 256.0 * TICKS_PER_SAMPLE_48K;
+            let spp = crate::panels::waveform::BUCKET as f64 * TICKS_PER_SAMPLE_48K;
             let mut mesh = egui::Mesh::default();
             let col = Color32::from_rgb(0x4f, 0xc3, 0x7a);
             for x in (area.min.x.floor() as i32)..(area.max.x.ceil() as i32) {
                 let f0 = (x as f32 - area.min.x) / area.width();
                 let f1 = (x as f32 + 1.0 - area.min.x) / area.width();
-                let s0 = (dur * f0 as f64 / spp) as usize;
-                let s1 = ((dur * f1 as f64 / spp) as usize).max(s0 + 1);
-                let (lo, hi) = peaks.iter().skip(s0).take(s1 - s0).fold((0f32, 0f32), |(l, h), (a, b)| (l.min(*a), h.max(*b)));
+                let (lo, hi) = peaks.range_all(dur * f0 as f64 / spp, dur * f1 as f64 / spp);
                 if hi - lo > 0.002 {
                     mesh.add_colored_rect(
                         Rect::from_min_max(pos2(x as f32, mid - hi.min(1.0) * half), pos2(x as f32 + 1.0, mid - lo.max(-1.0) * half + 1.0)),

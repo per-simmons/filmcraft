@@ -443,6 +443,15 @@ pub struct TimelinePrefs {
     pub auto_scroll: String,
     /// "Timeline Mouse Scrolling": `vertical` | `horizontal`.
     pub mouse_scrolling: String,
+    /// What Option (Alt) + wheel does over the clips of a track: `trackHeight` (resize the track
+    /// under the pointer, as over its header) | `zoom` (zoom the Timeline about the pointer, which
+    /// is what Premiere Pro does there). Over the track headers it always resizes the track, over
+    /// the time ruler it always zooms.
+    pub option_wheel_over_tracks: String,
+    /// Timeline Display Settings ▸ Rectified Audio Waveforms: audio clips draw each channel's
+    /// waveform one-sided, rising from the bottom of its lane (Premiere's default); off = centred
+    /// and two-sided.
+    pub rectified_audio_waveforms: bool,
     /// Default Audio Tracks per media type: `useFile` | `mono` | `stereo` | `5.1` | `adaptive`.
     pub mono_media_tracks: String,
     pub stereo_media_tracks: String,
@@ -470,6 +479,8 @@ impl Default for TimelinePrefs {
             still_image_unit: "seconds".into(),
             auto_scroll: "pageScroll".into(),
             mouse_scrolling: "vertical".into(),
+            option_wheel_over_tracks: "trackHeight".into(),
+            rectified_audio_waveforms: true,
             mono_media_tracks: "useFile".into(),
             stereo_media_tracks: "useFile".into(),
             surround_media_tracks: "useFile".into(),
@@ -691,6 +702,7 @@ const CACHE_MGMT: &[(&str, &str)] = &[
 ];
 const AUTO_SCROLL: &[(&str, &str)] = &[("noScroll", "No Scroll"), ("pageScroll", "Page Scroll"), ("smoothScroll", "Smooth Scroll")];
 const MOUSE_SCROLL: &[(&str, &str)] = &[("vertical", "Vertical"), ("horizontal", "Horizontal")];
+const OPTION_WHEEL: &[(&str, &str)] = &[("trackHeight", "Resizes the track under the pointer"), ("zoom", "Zooms the Timeline")];
 const HW_DECODE: &[(&str, &str)] = &[("auto", "Auto"), ("off", "Off")];
 const TRACKS: &[(&str, &str)] = &[("useFile", "Use File"), ("mono", "Mono"), ("stereo", "Stereo"), ("5.1", "5.1"), ("adaptive", "Adaptive")];
 pub const DURATION_UNITS: &[(&str, &str)] = &[("frames", "Frames"), ("seconds", "Seconds")];
@@ -1023,6 +1035,8 @@ static CATEGORIES: &[Category] = &[
             f("timeline.stillImageDuration", "Still Image Default Duration", Kind::Duration { unit_key: "timeline.stillImageUnit" }, true),
             f("timeline.autoScroll", "Timeline Playback Auto-Scrolling", Kind::Choice(AUTO_SCROLL), true),
             f("timeline.mouseScrolling", "Timeline Mouse Scrolling", Kind::Choice(MOUSE_SCROLL), true),
+            f("timeline.optionWheelOverTracks", "Option + wheel over the tracks", Kind::Choice(OPTION_WHEEL), true),
+            b("timeline.rectifiedAudioWaveforms", "Rectified audio waveforms", true),
             Row::Group(
                 "Default Audio Tracks",
                 &[

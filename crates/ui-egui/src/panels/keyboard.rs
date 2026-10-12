@@ -15,6 +15,7 @@
 //! | `playback.inToOutPreroll` / `playback.toOut` | Play In to Out with Preroll/Postroll / Play from Playhead to Out Point | Shift+Space / Ctrl+Space |
 //! | `timeline.expandAllTracks` / `timeline.minimizeAllTracks` | Expand / Minimize All Tracks | Shift+= / Shift+- |
 //! | `timeline.increaseVideoHeight` … `timeline.decreaseAudioHeight` | Increase / Decrease Video / Audio Tracks Height | Cmd+= / Cmd+- / Alt+= / Alt+- (Timeline) |
+//! | `timeline.setTrackHeight` | One track's height (Option + wheel over the track; `{track, height \| wheel, all?, fine?}`) | |
 //! | `timeline.nextScreen` / `timeline.prevScreen` | Show Next / Previous Screen | PageDown / PageUp (Timeline) |
 //! | `projectPanel.*` | Project panel: List / Icon / Toggle View, Hover Scrub, thumbnail size, Move / Extend Selection | (Project) |
 //! | `textPanel.*` | Text panel transcript: word / line / segment navigation and selection, Delete, Ripple Delete, Show Program Transcript | (Text) |
@@ -79,6 +80,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("timeline.decreaseVideoHeight", "Decrease Video Tracks Height", [], None),
     uic!("timeline.increaseAudioHeight", "Increase Audio Tracks Height", [], None),
     uic!("timeline.decreaseAudioHeight", "Decrease Audio Tracks Height", [], None),
+    uic!("timeline.setTrackHeight", "Set Track Height", [], None),
     uic!("timeline.nextScreen", "Show Next Screen", [], None),
     uic!("timeline.prevScreen", "Show Previous Screen", [], None),
     uic!("projectPanel.viewList", "List", [], None),
@@ -181,11 +183,20 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         "playback.inToOutPreroll" => play_range(app, true),
         "playback.toOut" => play_range(app, false),
         "timeline.expandAllTracks" | "timeline.minimizeAllTracks" => Ok(all_heights(app, id == "timeline.expandAllTracks")),
+        "timeline.setTrackHeight" => crate::panels::timeline::set_track_height_command(app, params),
         "timeline.increaseVideoHeight" | "timeline.decreaseVideoHeight" | "timeline.increaseAudioHeight" | "timeline.decreaseAudioHeight" => {
             let d = if id.contains("increase") { HEIGHT_STEP } else { -HEIGHT_STEP };
+            let video = id.contains("Video");
             let tv = &mut app.ui.timeline;
-            let h = if id.contains("Video") { &mut tv.video_track_h } else { &mut tv.audio_track_h };
+            let h = if video { &mut tv.video_track_h } else { &mut tv.audio_track_h };
             *h = (*h + d).clamp(MIN_TRACK_H, MAX_TRACK_H);
+            // tracks with a height of their own change by the same step
+            let ids = app.session.active_sequence().map(|q| crate::panels::timeline::kind_track_ids(q, video)).unwrap_or_default();
+            for t in ids {
+                if let Some(h) = tv.track_heights.get(&t).copied() {
+                    tv.set_track_height(t, (h + d).clamp(MIN_TRACK_H, MAX_TRACK_H));
+                }
+            }
             Ok(json!({"videoTrackHeight": tv.video_track_h, "audioTrackHeight": tv.audio_track_h}))
         }
         "timeline.nextScreen" | "timeline.prevScreen" => {
@@ -299,6 +310,8 @@ fn play_range(app: &mut FilmcraftApp, preroll: bool) -> Result<Value, String> {
 }
 
 fn all_heights(app: &mut FilmcraftApp, expand: bool) -> Value {
+    // every track takes the kind's height (tracks resized on their own included)
+    app.ui.timeline.track_heights.clear();
     let tv = &mut app.ui.timeline;
     let target = if expand { 120.0 } else { MIN_TRACK_H };
     let at_target = tv.video_track_h == target && tv.audio_track_h == target;

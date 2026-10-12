@@ -19,7 +19,7 @@ fn three_tabs() -> (Session, [ItemId; 3]) {
 }
 
 fn view(pps: f64, scroll: f64) -> SequenceView {
-    SequenceView { pps, scroll, v_scroll: 12.0, a_scroll: 7.0, video_track_h: 90.0, audio_track_h: 40.0 }
+    SequenceView { pps, scroll, v_scroll: 12.0, a_scroll: 7.0, video_track_h: 90.0, audio_track_h: 40.0, track_heights: Default::default() }
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -130,7 +130,7 @@ fn a_damaged_view_in_a_project_file_is_cleaned_up_or_ignored() {
         "open_sequences": [c.0, 999_999, footage.0, c.0, b.0],
         "active_sequence": 999_999,
         "sequences": {
-            b.0.to_string(): {"pps": 1e300, "scroll": -5.0, "v_scroll": 1e30, "a_scroll": -1.0, "video_track_h": 0.0, "audio_track_h": 1e9},
+            b.0.to_string(): {"pps": 1e300, "scroll": -5.0, "v_scroll": 1e30, "a_scroll": -1.0, "video_track_h": 0.0, "audio_track_h": 1e9, "track_heights": {"7": 1e9, "8": -3.0, "9": 120.0}},
             "999999": {"pps": 40.0, "scroll": 0.0, "video_track_h": 60.0, "audio_track_h": 56.0},
             footage.0.to_string(): {"pps": 40.0, "scroll": 0.0, "video_track_h": 60.0, "audio_track_h": 56.0},
         },
@@ -138,9 +138,11 @@ fn a_damaged_view_in_a_project_file_is_cleaned_up_or_ignored() {
     assert_eq!(t.state.open_sequences, [c, b]);
     assert_eq!(t.state.active_sequence, Some(c), "an active tab that is not open: the first tab");
     assert_eq!(t.state.timeline_views.len(), 1);
-    let v = t.state.timeline_views[&b];
+    let v = t.state.timeline_views[&b].clone();
     assert!(v.pps <= 1e5 && v.scroll == 0.0 && v.v_scroll <= 1e6 && v.a_scroll == 0.0);
     assert!(v.video_track_h >= 8.0 && v.audio_track_h <= 600.0);
+    // tracks resized on their own: kept, brought into range
+    assert_eq!(v.track_heights, [(7, 600.0), (8, 8.0), (9, 120.0)].into());
 
     // not a view at all: the project opens as it does without one
     for junk in [json!("tabs"), json!([1, 2, 3]), json!({"open_sequences": "all"}), json!({"sequences": {"x": 1}}), json!(null)] {

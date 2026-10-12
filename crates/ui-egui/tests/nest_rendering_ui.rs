@@ -66,14 +66,14 @@ impl Driver {
 }
 
 impl Driver {
-    /// The cached waveform peaks of `item`, once `ready` accepts them (they are made in the
+    /// The cached waveform peaks of `item` (its first channel), once `ready` accepts them (they are made in the
     /// background; drawing the Timeline asks for them).
     fn peaks_when(&mut self, item: u64, ready: impl Fn(&[(f32, f32)]) -> bool) -> Vec<(f32, f32)> {
         for _ in 0..400 {
             self.frames(1);
             let got = self.app().tl.peaks.lock().unwrap().get(&ItemId(item)).cloned();
-            if let Some(p) = got.filter(|p| ready(p)) {
-                return p.to_vec();
+            if let Some(p) = got.filter(|p| ready(p.base(0))) {
+                return p.base(0).to_vec();
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

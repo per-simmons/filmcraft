@@ -1,7 +1,9 @@
 //! Headless UI tests of scrolling the Timeline: what the wheel does with each modifier, how far
 //! the view can go, and the zoom scroll bar. Premiere Pro 26.5.2 on macOS, checked in the app: the
 //! wheel moves the tracks up and down, Cmd + wheel moves the Timeline sideways, Option + wheel
-//! zooms, and the view stops ten minutes past the end of the sequence.
+//! zooms (FilmCraft: over the ruler; over the tracks it resizes the track under the pointer unless
+//! Settings ▸ Timeline ▸ "Option + wheel over the tracks" is "zoom"), Option + wheel over a track
+//! header resizes that track, and the view stops ten minutes past the end of the sequence.
 
 use std::sync::mpsc::{Sender, channel};
 
@@ -143,7 +145,9 @@ fn cmd_wheel_moves_the_timeline_sideways_and_option_wheel_zooms() {
     assert_eq!(d.view(), (1.0, 50.0, 0.0, 0.0));
     d.wheel(0.8, 0.0, 1e5, json!({"command": true}));
     assert_eq!(d.view().0, 0.0, "not before the start");
-    // Option + wheel: zoom about the pointer; it is not what Cmd + wheel does
+    // Option + wheel: zoom about the pointer; it is not what Cmd + wheel does (over the tracks
+    // with the setting at Premiere's "zoom")
+    d.app().session.prefs.timeline.option_wheel_over_tracks = "zoom".into();
     d.ok("ui.set", json!({"timeline": {"scroll": 4.0}}));
     d.frames(3);
     let tracks = d.rect("timeline.tracks");
@@ -175,8 +179,9 @@ fn the_mouse_scrolling_setting_swaps_wheel_and_cmd_wheel() {
     assert_eq!(d.view(), (6.0, 50.0, 0.0, 0.0));
     d.wheel(0.2, 0.0, 40.0, json!({"command": true}));
     assert_eq!(d.view(), (6.0, 50.0, 40.0, 0.0));
-    d.wheel(0.2, 0.0, 20.0, json!({"alt": true}));
-    assert!((d.view().1 - 60.0).abs() < 1e-6, "Option + wheel zooms either way");
+    d.ok("ui.scroll", json!({"id": "timeline.ruler", "fx": 0.5, "fy": 0.5, "dy": 20.0, "modifiers": {"alt": true}}));
+    d.frames(3);
+    assert!((d.view().1 - 60.0).abs() < 1e-6, "Option + wheel over the ruler zooms either way");
 }
 
 /// The view cannot leave the Timeline: scrolled 39 minutes past a 26 second sequence, nothing was
@@ -262,4 +267,116 @@ fn the_scroll_bar_thumb_follows_the_pointer_and_reaches_both_ends() {
     d.frames(3);
     let (scroll, pps, ..) = d.view();
     assert!(pps < 50.0 && (scroll - at).abs() < 1e-6, "{pps} {scroll}");
+}
+
+impl Driver {
+    /// Turn the wheel over element `id` (at its middle) with modifiers.
+    fn wheel_on(&mut self, id: &str, dy: f64, modifiers: Value) {
+        self.ok("ui.scroll", json!({"id": id, "fx": 0.5, "fy": 0.5, "dx": 0.0, "dy": dy, "modifiers": modifiers}));
+        self.frames(3);
+    }
+
+    /// Heights of the tracks named (V1, A2…) the Timeline lays out.
+    fn heights(&mut self, labels: &[&str]) -> Vec<f32> {
+        let seq = self.app().session.active_sequence().unwrap().clone();
+        labels
+            .iter()
+            .map(|l| {
+                let i: usize = l[1..].parse().unwrap();
+                let video = l.starts_with('V');
+                let id = if video { seq.video_tracks[i - 1].id.0 } else { seq.audio_tracks[i - 1].id.0 };
+                self.app().ui.timeline.track_height(id, video)
+            })
+            .collect()
+    }
+}
+
+/// Option + wheel over a track (its clips or its header) makes that track taller or shorter, a
+/// step proportional to its height per notch, and nothing else moves: no zoom, no scroll.
+#[test]
+fn option_wheel_over_a_track_resizes_that_track_only() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"timeline": {"pps": 50.0, "scroll": 4.0}}));
+    d.frames(4);
+    let before = d.view();
+    let h0 = d.heights(&["V1", "V2", "A1", "A2"]);
+    // over A1's lane, wheel up: A1 grows by about a fifth, the rest stay
+    d.wheel_on("timeline.track.A1.row", 40.0, json!({"alt": true}));
+    let h1 = d.heights(&["V1", "V2", "A1", "A2"]);
+    assert!(h1[2] > h0[2] * 1.18 && h1[2] < h0[2] * 1.26, "A1 {} → {}", h0[2], h1[2]);
+    assert_eq!((h1[0], h1[1], h1[3]), (h0[0], h0[1], h0[3]), "only A1");
+    assert_eq!(d.view(), before, "no zoom and no scroll while Option is held over a track");
+    // over V1's header, wheel down: V1 shrinks
+    d.wheel_on("timeline.track.V1.header", -40.0, json!({"alt": true}));
+    let h2 = d.heights(&["V1", "V2", "A1", "A2"]);
+    assert!(h2[0] < h0[0] * 0.85, "V1 {} → {}", h0[0], h2[0]);
+    assert_eq!((h2[1], h2[2], h2[3]), (h1[1], h1[2], h1[3]));
+    assert_eq!(d.view(), before);
+    // Cmd as well: finer steps
+    d.wheel_on("timeline.track.A2.row", 40.0, json!({"alt": true, "command": true}));
+    let h3 = d.heights(&["A2"])[0];
+    assert!(h3 > h0[3] && h3 < h0[3] * 1.08, "fine: A2 {} → {h3}", h0[3]);
+    assert_eq!(d.view(), before);
+    // Shift + Option: every audio track takes A1's new height; the video tracks stay
+    d.wheel_on("timeline.track.A1.row", 40.0, json!({"alt": true, "shift": true}));
+    let h4 = d.heights(&["V1", "V2", "A1", "A2"]);
+    assert!(h4[2] > h1[2] && (h4[2] - h4[3]).abs() < 0.01, "all audio tracks: {h4:?}");
+    assert_eq!((h4[0], h4[1]), (h2[0], h2[1]));
+    // Shift + wheel over a header (Premiere): every track of its kind
+    d.wheel_on("timeline.track.V2.header", 40.0, json!({"shift": true}));
+    let h5 = d.heights(&["V1", "V2"]);
+    assert!(h5[1] > h2[1] && (h5[0] - h5[1]).abs() < 0.01, "all video tracks: {h5:?}");
+    assert_eq!(d.view(), before);
+    // clamped: a big spin never goes past the largest or under the smallest height
+    let seq = d.app().session.state.active_sequence.unwrap();
+    let a1 = d.app().session.active_sequence().unwrap().audio_tracks[0].id.0;
+    d.wheel_on("timeline.track.A1.row", 1e6, json!({"alt": true}));
+    assert_eq!(d.app().ui.timeline.track_height(a1, false), filmcraft_ui_egui::state::TRACK_H_MAX);
+    d.wheel_on("timeline.track.A1.row", -1e6, json!({"alt": true}));
+    assert_eq!(d.app().ui.timeline.track_height(a1, false), filmcraft_ui_egui::state::TRACK_H_MIN);
+    // the heights are kept with the sequence's view (saved beside the project)
+    d.frames(2);
+    let kept = d.app().session.state.timeline_views.get(&seq).cloned().expect("the view is kept");
+    assert_eq!(kept.track_heights.get(&a1).copied(), Some(filmcraft_ui_egui::state::TRACK_H_MIN));
+    // Option + wheel over the ruler still zooms
+    d.wheel_on("timeline.ruler", 20.0, json!({"alt": true}));
+    assert!((d.view().1 - 60.0).abs() < 1e-6, "zoom over the ruler: {:?}", d.view());
+    // the setting at "zoom": over the clips Option + wheel zooms, over a header it still resizes
+    d.app().session.prefs.timeline.option_wheel_over_tracks = "zoom".into();
+    let a2 = d.heights(&["A2"])[0];
+    d.wheel_on("timeline.track.A2.row", 20.0, json!({"alt": true}));
+    assert!((d.view().1 - 72.0).abs() < 1e-6 && d.heights(&["A2"])[0] == a2);
+    d.wheel_on("timeline.track.A2.header", 40.0, json!({"alt": true}));
+    assert!(d.heights(&["A2"])[0] > a2);
+}
+
+/// `timeline.setTrackHeight`: what Option + wheel does, for agents.
+#[test]
+fn set_track_height_is_a_command() {
+    let mut d = Driver::demo();
+    let r = d.exec("timeline.setTrackHeight", json!({"track": "A1", "height": 150.0}));
+    assert_eq!((r["track"].as_str(), r["height"].as_f64()), (Some("A1"), Some(150.0)));
+    d.frames(3);
+    assert_eq!(d.heights(&["A1"])[0], 150.0);
+    // and the Timeline lays A1 out that tall (the audio half scrolled to the top)
+    d.app().ui.timeline.split = 0.2;
+    d.frames(3);
+    assert!((d.rect("timeline.track.A1.row")[3] - 150.0).abs() < 0.01);
+    let r = d.exec("timeline.setTrackHeight", json!({"track": "A1", "wheel": -40.0}));
+    assert!(r["height"].as_f64().unwrap() < 125.0);
+    let r = d.exec("timeline.setTrackHeight", json!({"track": "V1", "height": 90.0, "all": true}));
+    assert_eq!(r["videoTrackHeight"].as_f64(), Some(90.0));
+    // hostile parameters: an error, never a crash
+    for bad in [
+        json!({}),
+        json!({"track": "Z9", "height": 50.0}),
+        json!({"track": "A99", "height": 50.0}),
+        json!({"track": "A1"}),
+        json!({"track": [1], "height": 1.0}),
+    ] {
+        let v = d.call("engine.execute", json!({"command": "timeline.setTrackHeight", "params": bad}));
+        assert_eq!(v["ok"], json!(false), "{bad} should fail: {v}");
+    }
+    let r = d.exec("timeline.setTrackHeight", json!({"track": "A1", "height": 1e30}));
+    assert_eq!(r["height"].as_f64(), Some(filmcraft_ui_egui::state::TRACK_H_MAX as f64));
 }

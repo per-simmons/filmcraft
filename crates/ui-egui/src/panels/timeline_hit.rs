@@ -291,6 +291,7 @@ mod tests {
             pps: 100.0,
             scroll: 0.0,
             split_y: TOP + 60.0,
+            tracks_y: (TOP, TOP + 60.0),
         };
         (seq, layout, track)
     }
