@@ -720,6 +720,7 @@ impl FilmcraftApp {
             self.playback.meter.start(speed);
         }
         self.playback.playing = true;
+        self.session.playing = true;
         self.playback.speed = speed;
         self.playback.anchor_tick = self.session.playhead();
         self.playback.anchor_time = -1.0; // set when the preroll ends
@@ -752,6 +753,7 @@ impl FilmcraftApp {
 
     pub fn stop(&mut self) {
         self.playback.playing = false;
+        self.session.playing = false;
         self.playback.clock_tick = None;
         self.playback.stop_at = None;
         self.playback.preroll = None;
@@ -1671,6 +1673,8 @@ impl eframe::App for FilmcraftApp {
             self.ui_error = Some(crash::take_last().unwrap_or_else(|| "unknown error".into()));
             self.playback.playing = false;
         }
+        // edit-point navigation passes over the cut just crossed only while playing
+        self.session.playing = self.playback.playing;
         self.auto.end_frame();
         self.error_window(ui.ctx());
         let ctx = ui.ctx().clone();

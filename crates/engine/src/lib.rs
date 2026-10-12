@@ -397,6 +397,12 @@ pub struct Session {
     pub log: panels::EventLog,
     /// Media Browser navigation (directory, back / forward history, selected files).
     pub browser: media_browser::BrowserState,
+    /// The frontend's transport is playing (the UI sets it on play / stop). Go to Previous Edit
+    /// Point reads it: while playing it passes over the cut the playhead has only just crossed.
+    pub playing: bool,
+    /// Where the last Go to Previous Edit Point took the playhead (sequence, time): pressed again
+    /// while playing, it goes on to the edit before instead of back to the same cut.
+    pub(crate) prev_edit_target: Option<(ItemId, Tick)>,
     /// Nesting depth of [`Session::execute`] (commands that run other commands).
     exec_depth: u32,
 }
@@ -487,6 +493,8 @@ impl Session {
             face_detector: None,
             log: Default::default(),
             browser: Default::default(),
+            playing: false,
+            prev_edit_target: None,
             exec_depth: 0,
         }
     }
