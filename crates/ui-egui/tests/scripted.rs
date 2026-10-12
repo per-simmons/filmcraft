@@ -280,9 +280,13 @@ fn trim_monitor_buttons_and_dynamic_jkl_trimming() {
         let rate = &d.sequence()["settings"]["frame_rate"];
         254_016_000_000 * rate["den"].as_i64().unwrap() / rate["num"].as_i64().unwrap()
     };
-    // Selecting an edit point turns the Program monitor into the Trim Monitor.
+    // Selecting an edit point leaves the Program monitor alone (Premiere); Trim Edit opens the
+    // Trim Monitor.
     assert!(d.element_ids("trimMonitor.").is_empty());
     d.exec("trim.selectEditPoint", json!({"clip": clip, "edge": "out", "kind": "roll"}));
+    d.frames(3);
+    assert!(d.element_ids("trimMonitor.").is_empty(), "selecting an edit point doesn't open the Trim Monitor");
+    d.ok("ui.menu.invoke", json!({"id": "trim.edit"}));
     d.frames(3);
     let ids = d.element_ids("trimMonitor.");
     for id in [
@@ -371,6 +375,7 @@ fn screenshots() {
     }
     d.exec("playhead.set", json!({"seconds": 4.5}));
     d.exec("trim.selectNearest", json!({"kind": "rippleOut"}));
+    d.exec("trim.edit", json!({}));
     d.exec("trim.forwardMany", json!({}));
     d.screenshot("trim-monitor-ripple");
     d.exec("trim.toggleType", json!({}));

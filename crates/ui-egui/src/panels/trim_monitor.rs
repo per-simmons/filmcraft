@@ -1,5 +1,5 @@
-//! The Trim Monitor: while edit points are selected (trim mode) the Program monitor shows the
-//! outgoing clip's last frame and the incoming clip's first frame side by side, with their
+//! The Trim Monitor: after Trim Edit (`trim.edit`, double-click an edit point) the Program monitor
+//! shows the outgoing clip's last frame and the incoming clip's first frame side by side, with their
 //! timecodes, the Out/In shift counters and the trim buttons (−N, −1, Apply Default Transitions,
 //! +1, +N; N = Preferences ▸ Trim ▸ Large Trim Offset). Dragging in the outgoing picture trims the
 //! outgoing side, in the incoming picture the incoming side, between them rolls.
@@ -57,7 +57,11 @@ pub fn route_transport(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str) ->
         "playback.slowForward" if trimming => ("trim.shuttle", json!({"direction": "forward", "slow": true, "clock": clock})),
         "playback.slowReverse" if trimming => ("trim.shuttle", json!({"direction": "reverse", "slow": true, "clock": clock})),
         "playback.stop" if app.session.trim_play.active() => ("trim.shuttleStop", json!({"clock": clock})),
-        "playback.toggle" if trimming || app.session.trim_play.around.is_some() => ("trim.playAround", json!({"clock": clock, "toggle": true})),
+        // Space loops around the edit only in the Trim Monitor; with edit points merely selected
+        // on the timeline it plays the sequence normally (Premiere)
+        "playback.toggle" if (trimming && filmcraft_engine::trim::monitor_open(&app.session)) || app.session.trim_play.around.is_some() => {
+            ("trim.playAround", json!({"clock": clock, "toggle": true}))
+        }
         "playback.playAround" => ("trim.playAround", json!({"clock": clock, "loop": false})),
         _ => return None,
     };

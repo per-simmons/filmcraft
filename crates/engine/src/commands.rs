@@ -1896,6 +1896,7 @@ fn build() -> Vec<CommandSpec> {
             let clips = with_links(s, &clips);
             // selecting clips leaves trim mode (Premiere: clip and edit point selections are exclusive)
             s.state.edit_points.clear();
+            s.state.trim_monitor = false;
             s.state.trim_shift = Default::default();
             if bool_p(p, "toggle").unwrap_or(false) {
                 for c in clips {
@@ -2001,15 +2002,10 @@ fn build() -> Vec<CommandSpec> {
         cmd!("trim.selectNearestTrimOut", "Select Nearest Edit Point as Trim Out", [], None, "{}", has_seq, |s, _| {
             crate::trim::select_nearest(s, &json!({"kind": "trimOut"}))
         }),
-        cmd!("trim.edit", "Trim Edit", ["Sequence"], Some("Shift+T"), "{}", has_seq, |s, _| {
-            if s.state.edit_points.is_empty() {
-                crate::trim::select_nearest(s, &json!({"kind": "roll"}))
-            } else {
-                Ok(json!({"editPoints": s.state.edit_points}))
-            }
-        }),
+        cmd!("trim.edit", "Trim Edit", ["Sequence"], Some("Shift+T"), "{}", has_seq, |s, _| crate::trim::open_monitor(s)),
         cmd!("trim.clear", "Clear Edit Point Selection", [], None, "{}", has_edit_points, |s, _| {
             s.state.edit_points.clear();
+            s.state.trim_monitor = false;
             s.state.trim_shift = Default::default();
             s.trim_play.around = None;
             Ok(Value::Null)
