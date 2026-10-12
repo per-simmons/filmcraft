@@ -2276,7 +2276,7 @@ fn build() -> Vec<CommandSpec> {
             "Set Effect Parameter",
             [],
             None,
-            r##"{"clip":id,"effect":"motion"|index,"param":str,"mask":n?,"value":num|[x,y]|"#rrggbb"|bool|path,"time":ticks?,"merge":bool?,"begin":bool?}"##,
+            r##"{"clip":id,"effect":"motion"|index,"param":str,"mask":n?,"value":num|[x,y]|"#rrggbb"|bool|path,"time":ticks|"frame":i64|"seconds":f64?,"keyframe":bool?,"merge":bool?,"begin":bool?}"##,
             has_seq,
             |s, p| {
                 let c = clip_p(p, "clip").ok_or_else(|| bad("effects.setParam", "need `clip`"))?;
@@ -2285,6 +2285,9 @@ fn build() -> Vec<CommandSpec> {
                 let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
                 let ph = s.playhead();
                 let tl = time_p(s, p, "").unwrap_or(ph);
+                // `keyframe`: add (or replace) a keyframe there even when the parameter is not
+                // animated yet (stopwatch on + value in one step)
+                let force_key = bool_p(p, "keyframe").unwrap_or(false);
                 let pq = p.clone();
                 // `merge`: a drag of one parameter is one undo step (#201); `begin` starts a new one
                 let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("setParam:{}:{eff}:{pid}:{}", c.0, p.get("mask").unwrap_or(&Value::Null)));
@@ -2311,31 +2314,44 @@ fn build() -> Vec<CommandSpec> {
                     }
                     let prm = crate::masks::target_param(e, &pq, &pid).ok_or_else(|| bad("effects.setParam", format!("no param `{pid}`")))?;
                     let v = json_to_param(&prm.value, &val).ok_or_else(|| bad("effects.setParam", "value has the wrong type"))?;
-                    prm.set_at(mt, v);
+                    if force_key {
+                        prm.put_keyframe(mt, v);
+                    } else {
+                        prm.set_at(mt, v);
+                    }
                     Ok(())
                 })?;
                 Ok(Value::Null)
             }
         ),
-        cmd!("effects.toggleAnimation", "Toggle Animation", [], None, r#"{"clip":id,"effect":str|index,"param":str,"mask":n?}"#, has_seq, |s, p| {
-            let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleAnimation", "need `clip`"))?;
-            let pid = str_p(p, "param").ok_or_else(|| bad("effects.toggleAnimation", "need `param`"))?.to_string();
-            let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
-            let ph = s.playhead();
-            s.edit_sequence("Toggle Animation", |q, _, _| {
-                let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
-                let mt = it.source_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
-                let e = match &eff {
-                    Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
-                    Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
-                    _ => None,
-                }
-                .ok_or_else(|| bad("effects.toggleAnimation", "no such effect"))?;
-                crate::masks::target_param(e, p, &pid).ok_or_else(|| bad("effects.toggleAnimation", "no such param"))?.toggle_animation(mt);
-                Ok(())
-            })?;
-            Ok(Value::Null)
-        }),
+        cmd!(
+            "effects.toggleAnimation",
+            "Toggle Animation",
+            [],
+            None,
+            r#"{"clip":id,"effect":str|index,"param":str,"mask":n?,"time":ticks|"frame":i64|"seconds":f64?}"#,
+            has_seq,
+            |s, p| {
+                let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleAnimation", "need `clip`"))?;
+                let pid = str_p(p, "param").ok_or_else(|| bad("effects.toggleAnimation", "need `param`"))?.to_string();
+                let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
+                // the first keyframe goes at the given sequence time (default: the playhead)
+                let ph = time_p(s, p, "").unwrap_or(s.playhead());
+                s.edit_sequence("Toggle Animation", |q, _, _| {
+                    let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                    let mt = it.source_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
+                    let e = match &eff {
+                        Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
+                        Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+                        _ => None,
+                    }
+                    .ok_or_else(|| bad("effects.toggleAnimation", "no such effect"))?;
+                    crate::masks::target_param(e, p, &pid).ok_or_else(|| bad("effects.toggleAnimation", "no such param"))?.toggle_animation(mt);
+                    Ok(())
+                })?;
+                Ok(Value::Null)
+            }
+        ),
         cmd!("effects.toggleEnabled", "Toggle Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleEnabled", "need `clip`"))?;
             let idx = u64_p(p, "index").unwrap_or(0) as usize;
@@ -2391,7 +2407,7 @@ fn build() -> Vec<CommandSpec> {
             "Keyframe Interpolation",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}"#,
+            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks|"time":ticks|"frame":i64|"seconds":f64?,"all":bool?,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}"#,
             has_seq,
             |s, p| keyframe_op(s, p, "interp")
         ),
@@ -2558,6 +2574,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::presets::commands());
     v.extend(crate::export_tools::commands());
     v.extend(crate::transcript::commands());
+    v.extend(crate::push_in::commands());
     v.extend(crate::waveform::commands());
     v.extend(crate::screen_activity::commands());
     v.extend(crate::panels::commands());
@@ -2646,13 +2663,38 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                     "easeout" => filmcraft_project::Interpolation::EaseOut,
                     _ => filmcraft_project::Interpolation::Linear,
                 };
-                let k = prm.keyframes.iter_mut().find(|k| k.time == at).ok_or_else(|| bad("keyframe", "no keyframe at that time"))?;
-                k.interp = kind;
+                // `all`: every keyframe of the parameter (Premiere: click the parameter's name to
+                // select all its keys, then pick the interpolation)
+                let all = bool_p(p, "all").unwrap_or(false);
+                if all && prm.keyframes.is_empty() {
+                    return Err(bad("keyframe", "the parameter has no keyframes"));
+                }
+                let mut hit = false;
+                for k in prm.keyframes.iter_mut().filter(|k| all || k.time == at) {
+                    k.interp = combine_ease(k.interp, kind);
+                    hit = true;
+                }
+                if !hit {
+                    return Err(bad("keyframe", "no keyframe at that time"));
+                }
             }
         }
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// Premiere's Ease In / Ease Out change one side of a keyframe: easing the other side of a key
+/// already eased on one side gives a key eased on both (Bezier with flat handles), so Ease In
+/// then Ease Out on the same keys (Pat's push-ins) holds still at both ends.
+fn combine_ease(old: filmcraft_project::Interpolation, new: filmcraft_project::Interpolation) -> filmcraft_project::Interpolation {
+    use filmcraft_project::Interpolation as I;
+    match (old, new) {
+        (I::EaseIn, I::EaseOut) | (I::EaseOut, I::EaseIn) => I::Bezier,
+        // an eased-both key stays eased on both
+        (I::Bezier, I::EaseIn | I::EaseOut) => I::Bezier,
+        (_, n) => n,
+    }
 }
 
 fn in_out_range(s: &Session) -> Result<TimeRange> {
