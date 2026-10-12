@@ -41,6 +41,7 @@ pub mod relink;
 pub mod remix;
 pub mod scene_detect;
 pub mod scopes;
+pub mod screen_activity;
 pub mod sequence_extras;
 pub mod sequence_tools;
 pub mod settings;
@@ -50,6 +51,7 @@ pub mod sync;
 pub mod transcript;
 pub mod trim;
 pub mod voiceover;
+pub mod waveform;
 
 use std::sync::Arc;
 
@@ -1103,6 +1105,8 @@ mod ripple_delete_tests;
 #[cfg(test)]
 mod scopes_tests;
 #[cfg(test)]
+mod screen_activity_tests;
+#[cfg(test)]
 mod sequence_inspect_tests;
 #[cfg(test)]
 mod sequence_tabs_tests;
@@ -1130,3 +1134,5 @@ mod vfx_tests;
 mod voiceover_tests;
 #[cfg(test)]
 mod wasm_clock_tests;
+#[cfg(test)]
+mod waveform_tests;
