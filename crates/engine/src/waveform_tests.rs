@@ -343,3 +343,20 @@ fn speech_between_close_cuts_is_never_removed() {
     s.execute("transcript.deleteHits", json!({"filter": "fillers"})).unwrap();
     assert_eq!(word_texts(&mut s), ["about", "a", "What"]);
 }
+
+#[test]
+fn cut_silences_cuts_every_quiet_run_down_to_the_margins() {
+    // The voice map counts a word's decaying tail as voice, so pause cuts made from it leave
+    // ~120–140 ms at every cut (Muse Wonder 1.0, 2026-10-12). This pass measures the mix itself.
+    let (mut s, _) = session();
+    let dry = s.execute("waveform.cutSilences", json!({"dryRun": true})).unwrap();
+    assert_eq!(dry["cuts"].as_array().unwrap().len(), 4, "head, two gaps, tail: {dry}");
+    let r = s.execute("waveform.cutSilences", json!({})).unwrap();
+    assert!(near(&r["durationAfter"], 1.8 + 0.13 * 2.0, 0.1), "three words plus margins: {r}");
+    let left = s.execute("waveform.silences", json!({"minSeconds": 0.1})).unwrap();
+    assert_eq!(left["count"], 0, "nothing of 100 ms or more is left: {left}");
+    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["words"].as_array().unwrap().len(), 3);
+    // one undo step
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(near(&json!(s.active_sequence().unwrap().duration().seconds()), LEN, 0.01));
+}

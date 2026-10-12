@@ -296,21 +296,17 @@ fn envelope(s: &mut Session, p: &Value) -> Result<Value> {
 // waveform.silences
 // ---------------------------------------------------------------------------------------------
 
-fn silences(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "waveform.silences";
-    let r = range_p(s, p, cmd, 2.0)?;
-    let min = Tick::from_seconds_f64(f64_p(p, "minSeconds").filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.15));
-    let limit = u64_p(p, "maxResults").map(|v| v as usize).unwrap_or(200).clamp(1, 5000);
+/// Quiet runs (10 ms RMS windows under the gate) of at least `min` in `r` of the active sequence's
+/// mix: (runs, floor, speech level, gate, floor measured outside the voice).
+fn quiet_runs(s: &Session, r: TimeRange, min: Tick, gate_p: Option<f64>) -> Result<(Vec<TimeRange>, f64, f64, f64, bool)> {
     let (blk, t0) = blocks(s, r.start, r.end())?;
     let win = window_db(&blk);
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let voice = tx::sequence_voice(q, &s.project.transcripts);
     let (floor, speech, outside) = levels_outside_voice(&win, t0, &voice.spans);
-    let gate = f64_p(p, "gateDb").filter(|v| v.is_finite()).unwrap_or_else(|| auto_gate(floor));
+    let gate = gate_p.filter(|v| v.is_finite()).unwrap_or_else(|| auto_gate(floor));
     let hop = Tick::from_seconds_f64(HOP_MS / 1000.0);
     let at = |i: usize| t0 + Tick(hop.0.saturating_mul(i as i64));
-    let words = tx::sequence_words(q, &s.project.transcripts);
-    let cuts = edit_points(q);
     let mut runs: Vec<TimeRange> = Vec::new();
     let mut start: Option<usize> = None;
     for i in 0..=win.len() {
@@ -328,6 +324,18 @@ fn silences(s: &mut Session, p: &Value) -> Result<Value> {
             _ => {}
         }
     }
+    Ok((runs, floor, speech, gate, outside))
+}
+
+fn silences(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "waveform.silences";
+    let r = range_p(s, p, cmd, 2.0)?;
+    let min = Tick::from_seconds_f64(f64_p(p, "minSeconds").filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.15));
+    let limit = u64_p(p, "maxResults").map(|v| v as usize).unwrap_or(200).clamp(1, 5000);
+    let (runs, floor, speech, gate, outside) = quiet_runs(s, r, min, f64_p(p, "gateDb"))?;
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let words = tx::sequence_words(q, &s.project.transcripts);
+    let cuts = edit_points(q);
     let total: Tick = runs.iter().fold(Tick::ZERO, |a, r| a + r.duration);
     let longest = runs.iter().map(|r| r.duration).max().unwrap_or_default();
     let dur = s.active_sequence().map(|q| q.duration()).unwrap_or_default();
@@ -360,6 +368,68 @@ fn silences(s: &mut Session, p: &Value) -> Result<Value> {
         "durationSeconds": secs(r.duration),
         "runs": list,
         "truncated": runs.len() > limit,
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// waveform.cutSilences
+// ---------------------------------------------------------------------------------------------
+
+/// `waveform.cutSilences`: the level-based pause cut. Every quiet run of the mix (the
+/// `waveform.silences` ruler) of at least `minSeconds` (0.1) is ripple-deleted down to the margins
+/// (`keepAfterSeconds` after the sound before it, `keepBeforeSeconds` before the sound after it; Pat's
+/// 30 / 35 ms from the settings), inside clips and across cuts alike, edges rounded inward to whole
+/// frames. The voice map (which `transcript.deleteHits` uses) counts a word's decaying tail as voice,
+/// so its margins start late and ~120–140 ms stays at every cut; this pass measures what is heard.
+/// A run with a whole transcribed word inside it is left alone and reported (a very quiet word, or a
+/// recogniser hallucination to check). One undo step; `dryRun` lists the cuts.
+fn cut_silences(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "waveform.cutSilences";
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let dur = q.duration();
+    let r = range_p(s, p, cmd, 2.0)?;
+    let min = Tick::from_seconds_f64(f64_p(p, "minSeconds").filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.1));
+    let (keep_after, keep_before) = margins(s, p);
+    let (runs, _, _, gate, _) = quiet_runs(s, r, min, f64_p(p, "gateDb"))?;
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let words = tx::sequence_words(q, &s.project.transcripts);
+    let rate = s.sequence_rate();
+    let frame = rate.frame_duration();
+    let up = |t: Tick| {
+        let f = rate.frame_at(t);
+        if rate.tick_of(f) < t { rate.tick_of(f + 1) } else { rate.tick_of(f) }
+    };
+    let down = |t: Tick| rate.tick_of(rate.frame_at(t));
+    let eps = Tick::from_seconds_f64(0.01);
+    let mut cuts: Vec<TimeRange> = Vec::new();
+    let mut kept: Vec<Value> = Vec::new();
+    for rr in &runs {
+        let head = rr.start <= eps;
+        let tail = rr.end() + eps >= dur;
+        let a = if head { Tick::ZERO } else { up(rr.start + keep_after) };
+        let b = if tail { dur } else { down(rr.end() - keep_before) };
+        if b <= a || b - a < frame {
+            continue;
+        }
+        if let Some(w) = words.iter().find(|w| w.start >= a && w.end <= b) {
+            kept.push(json!({"start": secs(rr.start), "ms": ms(rr.duration), "word": w.text, "timecode": tc(s, rr.start)}));
+            continue;
+        }
+        cuts.push(TimeRange::from_bounds(a, b));
+    }
+    let total: Tick = cuts.iter().fold(Tick::ZERO, |acc, c| acc + c.duration);
+    let list: Vec<Value> = cuts.iter().map(|c| json!({"start": secs(c.start), "ms": ms(c.duration), "timecode": tc(s, c.start)})).collect();
+    if bool_p(p, "dryRun").unwrap_or(false) || cuts.is_empty() {
+        return Ok(json!({"dryRun": bool_p(p, "dryRun").unwrap_or(false), "cuts": list, "removedSeconds": secs(total), "gateDb": gate, "keptWithWords": kept}));
+    }
+    let before = dur;
+    let transcripts = s.project.transcripts.clone();
+    let removed = s.edit_sequence("Cut Silences", move |q, ctx, _| Ok(tx::ripple_delete_ranges(q, cuts, &transcripts, ctx)))?;
+    let after = s.active_sequence().map(|q| q.duration()).unwrap_or_default();
+    Ok(json!({
+        "cuts": list.len(), "removedSeconds": secs(removed), "durationBefore": secs(before), "durationAfter": secs(after),
+        "gateDb": gate, "keepAfterMs": ms(keep_after), "keepBeforeMs": ms(keep_before), "keptWithWords": kept,
+        "note": "re-run waveform.silences {minSeconds: 0.1}: what is left at each cut is the margins plus frame rounding",
     }))
 }
 
@@ -832,6 +902,16 @@ pub fn commands() -> Vec<CommandSpec> {
             r#"{"track":int?,"all":bool?,"levels":bool=true,"keepAfterSeconds":f?,"keepBeforeSeconds":f?,"tighten":bool=true}"#,
             joins,
         ),
+        CommandSpec {
+            id: "waveform.cutSilences",
+            label: "Cut Silences by Level",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"minSeconds":f=0.1,"gateDb":f?,"keepAfterSeconds":f?,"keepBeforeSeconds":f?,"from":seconds?,"to":seconds?,"dryRun":bool?}"#,
+            enabled: has_seq,
+            run: cut_silences,
+            journal: true,
+        },
         CommandSpec {
             id: "waveform.fixJoins",
             label: "Fix Cuts to the Waveform",
